@@ -6,7 +6,7 @@ Deploy the [HubZero](https://help.hubzero.org/) platform on AWS using either Ter
 
 **Current**: Single EC2 instance (Rocky Linux 8) running Apache 2.4, PHP 8.2, MariaDB 10.11 (local or RDS), and HubZero CMS v2.4. Optional Docker-based Solr search.
 
-**Future**: Split-tier with ALB, private subnets, EFS for shared storage, and Docker-based tool sessions.
+Planned architecture improvements are tracked in [GitHub Issues](https://github.com/scttfrdmn/aws-hubzero/milestone/3).
 
 ## Prerequisites
 
