@@ -1,0 +1,69 @@
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "environment" {
+  type        = string
+  description = "Deployment environment (test, staging, or prod)"
+  validation {
+    condition     = contains(["test", "staging", "prod"], var.environment)
+    error_message = "Environment must be test, staging, or prod."
+  }
+}
+
+variable "vpc_id" {
+  type        = string
+  description = "ID of the existing VPC"
+}
+
+variable "subnet_id" {
+  type        = string
+  description = "ID of a public subnet in the VPC"
+}
+
+variable "key_name" {
+  type        = string
+  default     = ""
+  description = "EC2 key pair name for SSH access (optional — SSM Session Manager is the recommended access method)"
+}
+
+variable "allowed_cidr" {
+  type        = string
+  description = "CIDR for inbound HTTP/HTTPS — do NOT use 0.0.0.0/0 in staging/prod"
+  validation {
+    condition     = can(cidrhost(var.allowed_cidr, 0))
+    error_message = "allowed_cidr must be a valid CIDR block (e.g. 203.0.113.5/32)."
+  }
+}
+
+variable "domain_name" {
+  type    = string
+  default = ""
+}
+
+variable "certbot_email" {
+  type        = string
+  default     = ""
+  description = "Email for Let's Encrypt certificate expiry notifications (recommended for staging/prod)"
+}
+
+variable "install_platform" {
+  type    = bool
+  default = false
+}
+
+variable "use_rds" {
+  type    = bool
+  default = false
+}
+
+variable "rds_subnet_ids" {
+  type        = list(string)
+  default     = []
+  description = "Subnet IDs for the RDS subnet group (required when use_rds=true, needs at least 2 AZs)"
+  validation {
+    condition     = length(var.rds_subnet_ids) == 0 || length(var.rds_subnet_ids) >= 2
+    error_message = "rds_subnet_ids must contain at least 2 subnets in different AZs when provided."
+  }
+}

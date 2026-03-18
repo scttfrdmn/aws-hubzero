@@ -1,0 +1,9 @@
+{
+  "vpcId": "vpc-xxxxxxxxxxxxxxxxx",
+  "environment": "test",
+  "allowedCidr": "YOUR_IP/32",
+  "domainName": "",
+  "certbotEmail": "",
+  "installPlatform": "false",
+  "useRds": "false"
+}

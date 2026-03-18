@@ -1,0 +1,34 @@
+# Node / CDK
+node_modules/
+cdk/node_modules/
+cdk/cdk.out/
+cdk/*.js
+cdk/*.d.ts
+cdk/bin/*.js
+cdk/bin/*.d.ts
+cdk/lib/*.js
+cdk/lib/*.d.ts
+
+# CDK context (contains environment-specific values)
+cdk/cdk.context.json
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+
+# Secrets / credentials
+*.pem
+*.key
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
