@@ -40,7 +40,8 @@ systemctl enable fail2ban
 ###############################################################################
 # 2. Apache 2.4
 ###############################################################################
-dnf -y install httpd mod_ssl mod_headers
+dnf -y install httpd mod_ssl
+# mod_headers is included in httpd on AL2023 — no separate package needed
 systemctl enable httpd
 
 # Shared security headers
