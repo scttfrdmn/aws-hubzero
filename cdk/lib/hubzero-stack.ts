@@ -2,6 +2,10 @@ import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as rds from "aws-cdk-lib/aws-rds";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
+import * as elbv2Targets from "aws-cdk-lib/aws-elasticloadbalancingv2-targets";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
+import * as wafv2 from "aws-cdk-lib/aws-wafv2";
 import * as dlm from "aws-cdk-lib/aws-dlm";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as sns from "aws-cdk-lib/aws-sns";
@@ -97,6 +101,12 @@ export class HubzeroStack extends cdk.Stack {
       this.node.tryGetContext("installPlatform") || "false";
     const useRds = this.node.tryGetContext("useRds") === "true";
     const enableS3Storage = this.node.tryGetContext("enableS3Storage") !== "false";
+    const enableAlb = this.node.tryGetContext("enableAlb") !== "false";
+    const acmCertificateArn: string =
+      this.node.tryGetContext("acmCertificateArn") || "";
+    const enableWaf = this.node.tryGetContext("enableWaf") !== "false";
+    const enableVpcEndpoints =
+      this.node.tryGetContext("enableVpcEndpoints") !== "false";
     const enableMonitoring = this.node.tryGetContext("enableMonitoring") !== "false";
     const alarmEmail: string = this.node.tryGetContext("alarmEmail") || "";
     const monConfig = MONITORING_CONFIG[props.environment];
@@ -110,12 +120,15 @@ export class HubzeroStack extends cdk.Stack {
       description: `HubZero ${props.environment}`,
       allowAllOutbound: false,
     });
-    for (const port of [80, 443]) {
-      sg.addIngressRule(
-        ec2.Peer.ipv4(allowedCidr),
-        ec2.Port.tcp(port),
-        `Port ${port}`
-      );
+    // Direct HTTP/HTTPS only when ALB is not in front
+    if (!enableAlb) {
+      for (const port of [80, 443]) {
+        sg.addIngressRule(
+          ec2.Peer.ipv4(allowedCidr),
+          ec2.Port.tcp(port),
+          `Port ${port}`
+        );
+      }
     }
     sg.addEgressRule(
       ec2.Peer.anyIpv4(),
@@ -246,6 +259,7 @@ export class HubzeroStack extends cdk.Stack {
       `export HUBZERO_ENABLE_MONITORING="${enableMonitoring}"`,
       `export HUBZERO_CW_LOG_GROUP_PREFIX="${logGroupPrefix}"`,
       `export HUBZERO_S3_BUCKET="${s3BucketName}"`,
+      `export HUBZERO_ENABLE_ALB="${enableAlb}"`,
     ];
 
     userData.addCommands(...envExports);
@@ -311,6 +325,175 @@ export class HubzeroStack extends cdk.Stack {
           resources: [cfnDb.attrMasterUserSecretSecretArn],
         })
       );
+    }
+
+    // --- ALB + ACM (optional) ---
+    if (enableAlb) {
+      const albSg = new ec2.SecurityGroup(this, "AlbSG", {
+        vpc,
+        description: `HubZero ALB ${props.environment}`,
+        allowAllOutbound: false,
+      });
+      for (const port of [80, 443]) {
+        albSg.addIngressRule(
+          ec2.Peer.ipv4(allowedCidr),
+          ec2.Port.tcp(port),
+          `ALB port ${port}`
+        );
+      }
+      albSg.addEgressRule(sg, ec2.Port.tcp(80), "To EC2 HTTP");
+
+      // Allow ALB to reach EC2
+      sg.addIngressRule(albSg, ec2.Port.tcp(80), "HTTP from ALB");
+
+      const alb = new elbv2.ApplicationLoadBalancer(this, "ALB", {
+        vpc,
+        internetFacing: true,
+        securityGroup: albSg,
+      });
+
+      const targetGroup = new elbv2.ApplicationTargetGroup(this, "TargetGroup", {
+        vpc,
+        port: 80,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+        targets: [new elbv2Targets.InstanceTarget(instance)],
+        healthCheck: { path: "/", healthyThresholdCount: 2 },
+      });
+
+      alb.addListener("HttpListener", {
+        port: 80,
+        defaultAction: elbv2.ListenerAction.redirect({
+          port: "443",
+          protocol: "HTTPS",
+          permanent: true,
+        }),
+      });
+
+      let albCertificate: acm.ICertificate | undefined;
+      if (acmCertificateArn) {
+        albCertificate = acm.Certificate.fromCertificateArn(
+          this,
+          "Cert",
+          acmCertificateArn
+        );
+      } else if (domainName) {
+        albCertificate = new acm.Certificate(this, "Cert", {
+          domainName,
+          validation: acm.CertificateValidation.fromDns(),
+        });
+      }
+
+      if (albCertificate) {
+        alb.addListener("HttpsListener", {
+          port: 443,
+          certificates: [albCertificate],
+          defaultAction: elbv2.ListenerAction.forward([targetGroup]),
+          sslPolicy: elbv2.SslPolicy.RECOMMENDED_TLS,
+        });
+      }
+
+      new cdk.CfnOutput(this, "AlbDnsName", { value: alb.loadBalancerDnsName });
+
+      // --- WAF v2 (optional) ---
+      if (enableWaf) {
+        const webAcl = new wafv2.CfnWebACL(this, "WebACL", {
+          name: `hubzero-${props.environment}`,
+          scope: "REGIONAL",
+          defaultAction: { allow: {} },
+          rules: [
+            {
+              name: "AWSManagedRulesCommonRuleSet",
+              priority: 1,
+              overrideAction: { none: {} },
+              statement: {
+                managedRuleGroupStatement: {
+                  vendorName: "AWS",
+                  name: "AWSManagedRulesCommonRuleSet",
+                },
+              },
+              visibilityConfig: {
+                cloudWatchMetricsEnabled: true,
+                metricName: "CommonRuleSet",
+                sampledRequestsEnabled: true,
+              },
+            },
+            {
+              name: "AWSManagedRulesKnownBadInputsRuleSet",
+              priority: 2,
+              overrideAction: { none: {} },
+              statement: {
+                managedRuleGroupStatement: {
+                  vendorName: "AWS",
+                  name: "AWSManagedRulesKnownBadInputsRuleSet",
+                },
+              },
+              visibilityConfig: {
+                cloudWatchMetricsEnabled: true,
+                metricName: "KnownBadInputs",
+                sampledRequestsEnabled: true,
+              },
+            },
+            {
+              name: "AWSManagedRulesSQLiRuleSet",
+              priority: 3,
+              overrideAction: { none: {} },
+              statement: {
+                managedRuleGroupStatement: {
+                  vendorName: "AWS",
+                  name: "AWSManagedRulesSQLiRuleSet",
+                },
+              },
+              visibilityConfig: {
+                cloudWatchMetricsEnabled: true,
+                metricName: "SQLiRuleSet",
+                sampledRequestsEnabled: true,
+              },
+            },
+          ],
+          visibilityConfig: {
+            cloudWatchMetricsEnabled: true,
+            metricName: `hubzero-${props.environment}`,
+            sampledRequestsEnabled: true,
+          },
+        });
+
+        new wafv2.CfnWebACLAssociation(this, "WebACLAssociation", {
+          resourceArn: alb.loadBalancerArn,
+          webAclArn: webAcl.attrArn,
+        });
+      }
+    }
+
+    // --- VPC Endpoints (optional) ---
+    if (enableVpcEndpoints) {
+      const vpcesg = new ec2.SecurityGroup(this, "VpcEndpointSG", {
+        vpc,
+        description: `HubZero VPC endpoint interfaces ${props.environment}`,
+        allowAllOutbound: false,
+      });
+      vpcesg.addIngressRule(sg, ec2.Port.tcp(443), "HTTPS from EC2");
+
+      vpc.addGatewayEndpoint("S3Endpoint", {
+        service: ec2.GatewayVpcEndpointAwsService.S3,
+      });
+
+      for (const [id, svc] of [
+        ["SsmEndpoint", ec2.InterfaceVpcEndpointAwsService.SSM],
+        ["SsmMessagesEndpoint", ec2.InterfaceVpcEndpointAwsService.SSM_MESSAGES],
+        ["Ec2MessagesEndpoint", ec2.InterfaceVpcEndpointAwsService.EC2_MESSAGES],
+        [
+          "SecretsManagerEndpoint",
+          ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
+        ],
+        ["LogsEndpoint", ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS],
+      ] as [string, ec2.InterfaceVpcEndpointAwsService][]) {
+        new ec2.InterfaceVpcEndpoint(this, id, {
+          vpc,
+          service: svc,
+          securityGroups: [vpcesg],
+          privateDnsEnabled: true,
+        });
+      }
     }
 
     // --- EBS Snapshot Lifecycle ---

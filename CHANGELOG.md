@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-18
+
+### Added
+- **Issue #12**: Application Load Balancer + ACM TLS via `enable_alb` variable (default: `true`)
+  - EC2 security group: HTTP/HTTPS ingress from `allowed_cidr` is removed when ALB is enabled; ALB SG → EC2 ingress rule added via `aws_security_group_rule`
+  - `aws_security_group.alb`, `aws_lb`, `aws_lb_target_group`, `aws_lb_target_group_attachment`
+  - `aws_lb_listener.http` (HTTP→HTTPS 301 redirect), `aws_lb_listener.https` (TLS forward)
+  - `aws_acm_certificate` with DNS validation (created when `acm_certificate_arn` is empty and `domain_name` is set)
+  - `web_url` output updated: uses ALB DNS name or custom domain when ALB is enabled
+  - New outputs: `alb_dns_name`, `acm_certificate_validation_cname`
+  - `scripts/userdata.sh`: certbot section guarded by `HUBZERO_ENABLE_ALB != true`
+  - CDK: `ApplicationLoadBalancer`, `ApplicationTargetGroup`, `ListenerAction.redirect`, `acm.Certificate`, `SslPolicy.RECOMMENDED_TLS`
+- **Issue #13**: AWS WAF v2 (regional) via `enable_waf` variable (default: `true`, requires `enable_alb`)
+  - `aws_wafv2_web_acl` with three managed rule groups in Block mode: CommonRuleSet, KnownBadInputsRuleSet, SQLiRuleSet
+  - `aws_wafv2_web_acl_association` attaches WAF to ALB
+  - CloudWatch alarm: `BlockedRequests` spike > 100 (informational)
+  - CDK: `CfnWebACL` + `CfnWebACLAssociation` constructs
+- **Issue #14**: VPC endpoints via `enable_vpc_endpoints` variable (default: `true`)
+  - Gateway endpoint: S3 (free)
+  - Interface endpoints: SSM, SSMMessages, EC2Messages, SecretsManager, CloudWatch Logs
+  - Dedicated VPC endpoint security group allowing HTTPS from EC2 SG
+  - CDK: `GatewayVpcEndpoint` for S3, `InterfaceVpcEndpoint` for remaining services
+
 ## [0.3.0] - 2026-03-18
 
 ### Added
@@ -71,7 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PHP hardening, Docker user namespace remapping, Composer integrity checks,
   encrypted EBS and RDS at rest, Secrets Manager for RDS credentials
 
-[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/aws-hubzero/releases/tag/v0.1.0

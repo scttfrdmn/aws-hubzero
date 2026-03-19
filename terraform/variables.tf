@@ -85,3 +85,27 @@ variable "alarm_email" {
   default     = ""
   description = "Email for CloudWatch alarm SNS notifications (empty = topic created, no subscription)"
 }
+
+variable "enable_alb" {
+  type        = bool
+  default     = true
+  description = "Provision an Application Load Balancer with HTTPS termination"
+}
+
+variable "acm_certificate_arn" {
+  type        = string
+  default     = ""
+  description = "Existing ACM certificate ARN for the ALB HTTPS listener. If empty and domain_name is set, a new certificate with DNS validation is created."
+}
+
+variable "enable_waf" {
+  type        = bool
+  default     = true
+  description = "Attach AWS WAF v2 (regional) to the ALB. Requires enable_alb=true."
+}
+
+variable "enable_vpc_endpoints" {
+  type        = bool
+  default     = true
+  description = "Create VPC endpoints for S3 (gateway) and SSM/Secrets Manager/CloudWatch (interface) services"
+}

@@ -74,20 +74,18 @@ resource "aws_security_group" "hubzero" {
   description = "HubZero ${var.environment} instance"
   vpc_id      = data.aws_vpc.selected.id
 
-  ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_cidr]
+  # Direct HTTP/HTTPS ingress only when ALB is not in front
+  dynamic "ingress" {
+    for_each = var.enable_alb ? [] : [80, 443]
+    content {
+      description = ingress.value == 80 ? "HTTP" : "HTTPS"
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "tcp"
+      cidr_blocks = [var.allowed_cidr]
+    }
   }
-  ingress {
-    description = "HTTPS"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_cidr]
-  }
+
   egress {
     description = "HTTPS outbound"
     from_port   = 443
@@ -288,6 +286,7 @@ resource "aws_instance" "hubzero" {
     "export HUBZERO_ENABLE_MONITORING='${tostring(var.enable_monitoring)}'",
     "export HUBZERO_CW_LOG_GROUP_PREFIX='/aws/ec2/hubzero-${var.environment}'",
     "export HUBZERO_S3_BUCKET='${var.enable_s3_storage ? aws_s3_bucket.hubzero[0].id : ""}'",
+    "export HUBZERO_ENABLE_ALB='${tostring(var.enable_alb)}'",
     file("${path.module}/../scripts/userdata.sh"),
   ]))
 
@@ -573,4 +572,295 @@ resource "aws_cloudwatch_metric_alarm" "rds_storage" {
   dimensions          = { DBInstanceIdentifier = aws_db_instance.hubzero[0].identifier }
   alarm_actions       = [aws_sns_topic.hubzero[0].arn]
   ok_actions          = [aws_sns_topic.hubzero[0].arn]
+}
+
+# --- ALB + ACM (optional) ---
+resource "aws_security_group" "alb" {
+  count       = var.enable_alb ? 1 : 0
+  name_prefix = "hubzero-alb-${var.environment}-"
+  description = "HubZero ALB ${var.environment}"
+  vpc_id      = data.aws_vpc.selected.id
+
+  ingress {
+    description = "HTTP from allowed CIDR"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_cidr]
+  }
+  ingress {
+    description = "HTTPS from allowed CIDR"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_cidr]
+  }
+  egress {
+    description     = "To EC2 HTTP"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.hubzero.id]
+  }
+}
+
+# Allow ALB SG to reach EC2 on port 80
+resource "aws_security_group_rule" "ec2_from_alb" {
+  count                    = var.enable_alb ? 1 : 0
+  type                     = "ingress"
+  from_port                = 80
+  to_port                  = 80
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.alb[0].id
+  security_group_id        = aws_security_group.hubzero.id
+  description              = "HTTP from ALB"
+}
+
+resource "aws_acm_certificate" "hubzero" {
+  count             = var.enable_alb && var.acm_certificate_arn == "" && var.domain_name != "" ? 1 : 0
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+locals {
+  acm_cert_arn = var.acm_certificate_arn != "" ? var.acm_certificate_arn : (
+    length(aws_acm_certificate.hubzero) > 0 ? aws_acm_certificate.hubzero[0].arn : ""
+  )
+}
+
+resource "aws_lb" "hubzero" {
+  count              = var.enable_alb ? 1 : 0
+  name_prefix        = "hz-${substr(var.environment, 0, 3)}-"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb[0].id]
+  subnets            = [data.aws_subnet.selected.id]
+}
+
+resource "aws_lb_target_group" "hubzero" {
+  count       = var.enable_alb ? 1 : 0
+  name_prefix = "hz-${substr(var.environment, 0, 3)}-"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.selected.id
+
+  health_check {
+    path                = "/"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+  }
+}
+
+resource "aws_lb_target_group_attachment" "hubzero" {
+  count            = var.enable_alb ? 1 : 0
+  target_group_arn = aws_lb_target_group.hubzero[0].arn
+  target_id        = aws_instance.hubzero.id
+  port             = 80
+}
+
+resource "aws_lb_listener" "http" {
+  count             = var.enable_alb ? 1 : 0
+  load_balancer_arn = aws_lb.hubzero[0].arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  count             = var.enable_alb && local.acm_cert_arn != "" ? 1 : 0
+  load_balancer_arn = aws_lb.hubzero[0].arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = local.acm_cert_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.hubzero[0].arn
+  }
+}
+
+# --- WAF v2 (optional, requires ALB) ---
+resource "aws_wafv2_web_acl" "hubzero" {
+  count = var.enable_waf && var.enable_alb ? 1 : 0
+  name  = "hubzero-${var.environment}"
+  scope = "REGIONAL"
+
+  default_action {
+    allow {}
+  }
+
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 1
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesCommonRuleSet"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "CommonRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 2
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "KnownBadInputs"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "AWSManagedRulesSQLiRuleSet"
+    priority = 3
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesSQLiRuleSet"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "SQLiRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "hubzero-${var.environment}"
+    sampled_requests_enabled   = true
+  }
+}
+
+resource "aws_wafv2_web_acl_association" "hubzero" {
+  count        = var.enable_waf && var.enable_alb ? 1 : 0
+  resource_arn = aws_lb.hubzero[0].arn
+  web_acl_arn  = aws_wafv2_web_acl.hubzero[0].arn
+}
+
+resource "aws_cloudwatch_metric_alarm" "waf_blocked" {
+  count               = var.enable_waf && var.enable_alb && var.enable_monitoring ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-waf-blocked"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "BlockedRequests"
+  namespace           = "AWS/WAFV2"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 100
+  alarm_description   = "WAF blocked requests spike (informational — check for false positives)"
+  dimensions = {
+    WebACL = "hubzero-${var.environment}"
+    Region = var.aws_region
+    Rule   = "ALL"
+  }
+  alarm_actions = [aws_sns_topic.hubzero[0].arn]
+}
+
+# --- VPC Endpoints (optional) ---
+resource "aws_security_group" "vpc_endpoints" {
+  count       = var.enable_vpc_endpoints ? 1 : 0
+  name_prefix = "hubzero-vpce-${var.environment}-"
+  description = "HubZero VPC endpoint interfaces ${var.environment}"
+  vpc_id      = data.aws_vpc.selected.id
+
+  ingress {
+    description     = "HTTPS from EC2"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.hubzero.id]
+  }
+}
+
+resource "aws_vpc_endpoint" "s3" {
+  count             = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id            = data.aws_vpc.selected.id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+}
+
+resource "aws_vpc_endpoint" "ssm" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = data.aws_vpc.selected.id
+  service_name        = "com.amazonaws.${var.aws_region}.ssm"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [data.aws_subnet.selected.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = data.aws_vpc.selected.id
+  service_name        = "com.amazonaws.${var.aws_region}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [data.aws_subnet.selected.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = data.aws_vpc.selected.id
+  service_name        = "com.amazonaws.${var.aws_region}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [data.aws_subnet.selected.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "secretsmanager" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = data.aws_vpc.selected.id
+  service_name        = "com.amazonaws.${var.aws_region}.secretsmanager"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [data.aws_subnet.selected.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "logs" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = data.aws_vpc.selected.id
+  service_name        = "com.amazonaws.${var.aws_region}.logs"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [data.aws_subnet.selected.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+  private_dns_enabled = true
 }

@@ -26,6 +26,7 @@ HUBZERO_CERTBOT_EMAIL="${HUBZERO_CERTBOT_EMAIL:-}"
 HUBZERO_ENABLE_MONITORING="${HUBZERO_ENABLE_MONITORING:-false}"
 HUBZERO_CW_LOG_GROUP_PREFIX="${HUBZERO_CW_LOG_GROUP_PREFIX:-/aws/ec2/hubzero}"
 HUBZERO_S3_BUCKET="${HUBZERO_S3_BUCKET:-}"
+HUBZERO_ENABLE_ALB="${HUBZERO_ENABLE_ALB:-false}"
 
 # Retrieve DB password: from Secrets Manager if ARN provided, else generate locally
 HUBZERO_DB_SECRET_ARN="${HUBZERO_DB_SECRET_ARN:-}"
@@ -112,9 +113,9 @@ cat > /etc/httpd/conf.d/hubzero.conf <<'APACHECONF'
 APACHECONF
 
 ###############################################################################
-# 2a. TLS via certbot (if domain is set and not an IP)
+# 2a. TLS via certbot (if domain is set, not an IP, and ALB is not handling TLS)
 ###############################################################################
-if [[ -n "${HUBZERO_DOMAIN}" && ! "${HUBZERO_DOMAIN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+if [[ "${HUBZERO_ENABLE_ALB}" != "true" && -n "${HUBZERO_DOMAIN}" && ! "${HUBZERO_DOMAIN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     dnf -y install certbot python3-certbot-apache
 
     CERTBOT_EMAIL_OPTS="--register-unsafely-without-email"
