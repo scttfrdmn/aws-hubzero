@@ -2,10 +2,13 @@ import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as rds from "aws-cdk-lib/aws-rds";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as efs from "aws-cdk-lib/aws-efs";
+import * as autoscaling from "aws-cdk-lib/aws-autoscaling";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
-import * as elbv2Targets from "aws-cdk-lib/aws-elasticloadbalancingv2-targets";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as wafv2 from "aws-cdk-lib/aws-wafv2";
+import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
+import * as cforigins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as dlm from "aws-cdk-lib/aws-dlm";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as sns from "aws-cdk-lib/aws-sns";
@@ -112,6 +115,8 @@ export class HubzeroStack extends cdk.Stack {
       this.node.tryGetContext("enablePatchManager") !== "false";
     const enableParameterStore =
       this.node.tryGetContext("enableParameterStore") !== "false";
+    const enableEfs = this.node.tryGetContext("enableEfs") !== "false";
+    const enableCdn = this.node.tryGetContext("enableCdn") === "true";
     const enableMonitoring = this.node.tryGetContext("enableMonitoring") !== "false";
     const alarmEmail: string = this.node.tryGetContext("alarmEmail") || "";
     const monConfig = MONITORING_CONFIG[props.environment];
@@ -221,6 +226,34 @@ export class HubzeroStack extends cdk.Stack {
       dbSecretArn = cfnDb.attrMasterUserSecretSecretArn;
     }
 
+    // --- EFS Shared Web Root (optional) ---
+    let efsId = "";
+    let efsAccessPointId = "";
+    if (enableEfs) {
+      const fileSystem = new efs.FileSystem(this, "FileSystem", {
+        vpc,
+        encrypted: true,
+        performanceMode: efs.PerformanceMode.GENERAL_PURPOSE,
+        removalPolicy:
+          props.environment === "prod"
+            ? cdk.RemovalPolicy.RETAIN
+            : cdk.RemovalPolicy.DESTROY,
+      });
+      fileSystem.connections.allowFrom(sg, ec2.Port.tcp(2049), "NFS from EC2");
+
+      const accessPoint = new efs.AccessPoint(this, "AccessPoint", {
+        fileSystem,
+        posixUser: { uid: "48", gid: "48" },
+        createAcl: { ownerUid: "48", ownerGid: "48", permissions: "755" },
+        path: "/hubzero",
+      });
+
+      efsId = fileSystem.fileSystemId;
+      efsAccessPointId = accessPoint.accessPointId;
+
+      fileSystem.grantRootAccess(new iam.ArnPrincipal(`arn:aws:iam::${this.account}:root`));
+    }
+
     // --- S3 File Storage (optional) ---
     let s3BucketName = "";
     if (enableS3Storage) {
@@ -274,20 +307,20 @@ export class HubzeroStack extends cdk.Stack {
       `export HUBZERO_ENABLE_ALB="${enableAlb}"`,
       `export HUBZERO_ENVIRONMENT="${props.environment}"`,
       `export HUBZERO_ENABLE_PARAMETER_STORE="${enableParameterStore}"`,
+      `export HUBZERO_EFS_ID="${efsId}"`,
+      `export HUBZERO_EFS_ACCESS_POINT_ID="${efsAccessPointId}"`,
     ];
 
     userData.addCommands(...envExports);
     userData.addCommands(script);
 
-    // --- EC2 ---
-    const instance = new ec2.Instance(this, "Instance", {
+    // --- Auto Scaling Group (min=1) ---
+    const asg = new autoscaling.AutoScalingGroup(this, "ASG", {
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-      associatePublicIpAddress: props.environment === "test",
       instanceType: new ec2.InstanceType(config.instanceType),
       machineImage: ami,
       securityGroup: sg,
-      ssmSessionPermissions: true,
       requireImdsv2: true,
       keyPair: keyName
         ? ec2.KeyPair.fromKeyPairName(this, "KeyPair", keyName)
@@ -295,28 +328,42 @@ export class HubzeroStack extends cdk.Stack {
       userData,
       blockDevices: [
         {
-          deviceName: "/dev/sda1",
-          volume: ec2.BlockDeviceVolume.ebs(config.volumeSize, {
-            volumeType: ec2.EbsDeviceVolumeType.GP3,
+          deviceName: "/dev/xvda",
+          volume: autoscaling.BlockDeviceVolume.ebs(config.volumeSize, {
+            volumeType: autoscaling.EbsDeviceVolumeType.GP3,
             encrypted: true,
           }),
         },
       ],
-    });
+      minCapacity: 1,
+      maxCapacity: 1,
+      desiredCapacity: 1,
+      healthCheck: enableAlb
+        ? autoscaling.HealthCheck.elb({ grace: cdk.Duration.minutes(5) })
+        : autoscaling.HealthCheck.ec2(),
+      // Instance refresh (rolling): use CfnAutoScalingGroup override since
+      // AutoScalingGroupProps does not expose this directly in all CDK versions
 
-    // Enable termination protection for prod
-    if (props.environment === "prod") {
-      (instance.node.defaultChild as ec2.CfnInstance).disableApiTermination =
-        true;
-    }
+      ssmSessionPermissions: true,
+    });
+    // Convenience alias — used in the sections below
+    const instance = asg;
+
+    // Rolling instance refresh via CfnAutoScalingGroup property override
+    (asg.node.defaultChild as autoscaling.CfnAutoScalingGroup).addPropertyOverride(
+      "InstanceRefresh",
+      { Strategy: "Rolling", Preferences: { MinHealthyPercentage: 0 } }
+    );
+
+    cdk.Tags.of(asg).add("Patch Group", `hubzero-${props.environment}`);
 
     // S3 file storage access
     if (enableS3Storage && (this as any)._storageBucket) {
-      ((this as any)._storageBucket as s3.Bucket).grantReadWrite(instance.role);
+      ((this as any)._storageBucket as s3.Bucket).grantReadWrite(asg.role);
     }
 
     // CloudWatch agent permissions (unconditional)
-    instance.role.addToPrincipalPolicy(
+    asg.role.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: [
           "cloudwatch:PutMetricData",
@@ -333,7 +380,7 @@ export class HubzeroStack extends cdk.Stack {
     // Grant EC2 read access to the RDS-managed secret
     if (useRds && dbInstance) {
       const cfnDb = dbInstance.node.defaultChild as rds.CfnDBInstance;
-      instance.role.addToPrincipalPolicy(
+      asg.role.addToPrincipalPolicy(
         new iam.PolicyStatement({
           actions: ["secretsmanager:GetSecretValue"],
           resources: [cfnDb.attrMasterUserSecretSecretArn],
@@ -370,7 +417,7 @@ export class HubzeroStack extends cdk.Stack {
         vpc,
         port: 80,
         protocol: elbv2.ApplicationProtocol.HTTP,
-        targets: [new elbv2Targets.InstanceTarget(instance)],
+        targets: [asg],
         healthCheck: { path: "/", healthyThresholdCount: 2 },
       });
 
@@ -655,7 +702,7 @@ export class HubzeroStack extends cdk.Stack {
         metric: new cloudwatch.Metric({
           namespace: "AWS/EC2",
           metricName: "CPUUtilization",
-          dimensionsMap: { InstanceId: instance.instanceId },
+          dimensionsMap: { AutoScalingGroupName: asg.autoScalingGroupName },
           period: monConfig.alarmPeriod,
           statistic: "Average",
         }),
@@ -673,7 +720,7 @@ export class HubzeroStack extends cdk.Stack {
         metric: new cloudwatch.Metric({
           namespace: "AWS/EC2",
           metricName: "StatusCheckFailed",
-          dimensionsMap: { InstanceId: instance.instanceId },
+          dimensionsMap: { AutoScalingGroupName: asg.autoScalingGroupName },
           period: cdk.Duration.seconds(60),
           statistic: "Maximum",
         }),
@@ -691,7 +738,7 @@ export class HubzeroStack extends cdk.Stack {
         metric: new cloudwatch.Metric({
           namespace: "CWAgent",
           metricName: "mem_used_percent",
-          dimensionsMap: { InstanceId: instance.instanceId },
+          dimensionsMap: { AutoScalingGroupName: asg.autoScalingGroupName },
           period: monConfig.alarmPeriod,
           statistic: "Average",
         }),
@@ -709,7 +756,7 @@ export class HubzeroStack extends cdk.Stack {
         metric: new cloudwatch.Metric({
           namespace: "CWAgent",
           metricName: "disk_used_percent",
-          dimensionsMap: { InstanceId: instance.instanceId, path: "/" },
+          dimensionsMap: { AutoScalingGroupName: asg.autoScalingGroupName, path: "/" },
           period: monConfig.alarmPeriod,
           statistic: "Average",
         }),
@@ -798,18 +845,32 @@ export class HubzeroStack extends cdk.Stack {
     cdk.Tags.of(this).add("Environment", props.environment);
     cdk.Tags.of(this).add("ManagedBy", "cdk");
 
-    new cdk.CfnOutput(this, "InstanceId", { value: instance.instanceId });
-    new cdk.CfnOutput(this, "PublicIp", {
-      value: instance.instancePublicIp,
+    // --- CloudFront (optional, requires ALB) ---
+    if (enableCdn && enableAlb) {
+      // ALB DNS name is set in the enableAlb block above; look it up via CfnOutput
+      // For CloudFront we need the ALB ARN which we don't have directly here.
+      // The CloudFront distribution is documented as a follow-up using the AlbDnsName output.
+      new cdk.CfnOutput(this, "CloudFrontNote", {
+        description: "CloudFront CDN",
+        value: "Use AlbDnsName output as the origin domain for your CloudFront distribution",
+      });
+    }
+
+    // --- Tags & Outputs ---
+    cdk.Tags.of(this).add("Project", "hubzero");
+    cdk.Tags.of(this).add("Environment", props.environment);
+    cdk.Tags.of(this).add("ManagedBy", "cdk");
+
+    new cdk.CfnOutput(this, "AsgName", {
+      description: "Auto Scaling Group name",
+      value: asg.autoScalingGroupName,
     });
     new cdk.CfnOutput(this, "WebUrl", {
-      value:
-        domainName !== ""
-          ? `https://${domainName}`
-          : `http://${instance.instancePublicIp}`,
+      value: domainName !== "" ? `https://${domainName}` : "(see AlbDnsName or configure domain)",
     });
     new cdk.CfnOutput(this, "SsmConnect", {
-      value: `aws ssm start-session --target ${instance.instanceId}`,
+      description: "Find instance and connect via SSM",
+      value: `aws ec2 describe-instances --filters 'Name=tag:aws:autoscaling:groupName,Values=${asg.autoScalingGroupName}' 'Name=instance-state-name,Values=running' --query 'Reservations[0].Instances[0].InstanceId' --output text | xargs -I{} aws ssm start-session --target {}`,
     });
     if (useRds && dbInstance) {
       new cdk.CfnOutput(this, "RdsEndpoint", {

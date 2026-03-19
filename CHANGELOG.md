@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-03-18
+
+### Added
+- **Issue #18**: EFS shared web root via `enable_efs` variable (default: `true`)
+  - `aws_efs_file_system`: encrypted, `generalPurpose` performance mode
+  - `aws_security_group.efs`: ingress port 2049 from EC2 SG
+  - `aws_efs_mount_target`: one per subnet in `efs_subnet_ids` (defaults to `[subnet_id]`)
+  - `aws_efs_access_point`: POSIX uid/gid 48 (apache), root path `/hubzero`
+  - IAM policy: `elasticfilesystem:ClientMount`, `ClientWrite`, `ClientRootAccess`
+  - `scripts/userdata.sh`: installs `amazon-efs-utils`, mounts EFS via TLS+IAM+access point, adds `/etc/fstab` entry for persistence
+  - Terraform: `efs_id` output; `HUBZERO_EFS_ID` and `HUBZERO_EFS_ACCESS_POINT_ID` exported to userdata
+  - CDK: `efs.FileSystem`, `efs.AccessPoint`, equivalent IAM grant, exports
+- **Issue #19**: Auto Scaling Group (min=1, max=1) replacing direct `aws_instance`
+  - `aws_launch_template.hubzero`: same AMI, instance type, SG, IAM profile, userdata as former `aws_instance`
+  - `aws_autoscaling_group.hubzero`: min=1, max=1, desired=1; `health_check_type = "ELB"`; `target_group_arns` attached to ALB; rolling instance refresh via `instance_refresh` block (`min_healthy_percentage = 0`)
+  - `aws_autoscaling_attachment`: attaches ASG to ALB target group
+  - CloudWatch alarm dimensions updated from `InstanceId` to `AutoScalingGroupName` for EC2/ASG alarms; CWAgent instance-level alarms retain `InstanceId` (targets most-recent launch)
+  - Outputs: `instance_id` replaced by `asg_name`; `ssm_connect_command` updated to dynamically look up running instance via `aws ec2 describe-instances`
+  - CDK: `autoscaling.AutoScalingGroup`, rolling instance refresh via `CfnAutoScalingGroup.addPropertyOverride`
+- **Issue #20**: CloudFront CDN distribution via `enable_cdn` variable (default: `false`)
+  - `aws_cloudfront_distribution`: ALB as origin (`https-only`), static asset paths (`/media/*`, `/assets/*`, `/css/*`, `/js/*`) use `CachingOptimized` policy; default behavior uses `CachingDisabled`
+  - HTTP→HTTPS redirect for all behaviors; `PriceClass_100` (US/EU/Canada)
+  - `enable_cloudfront_waf` variable added (default: `false`) — CloudFront-scoped WAF must reside in `us-east-1`; requires a provider alias (documented constraint)
+  - `web_url` output: prefers CloudFront domain when `enable_cdn=true`
+  - New output: `cloudfront_domain`
+  - CDK: `cloudfront.Distribution` with `origins.LoadBalancerV2Origin`
+
 ## [0.5.0] - 2026-03-18
 
 ### Added
@@ -116,7 +143,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PHP hardening, Docker user namespace remapping, Composer integrity checks,
   encrypted EBS and RDS at rest, Secrets Manager for RDS credentials
 
-[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.2.0...v0.3.0

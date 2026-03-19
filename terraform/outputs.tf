@@ -1,26 +1,32 @@
-output "instance_id" {
-  description = "EC2 instance ID"
-  value       = aws_instance.hubzero.id
-}
-
-output "public_ip" {
-  description = "Public IP (test environment only)"
-  value       = aws_instance.hubzero.public_ip
+output "asg_name" {
+  description = "Auto Scaling Group name (use to find the running instance)"
+  value       = aws_autoscaling_group.hubzero.name
 }
 
 output "public_dns" {
-  description = "Public DNS hostname"
-  value       = aws_instance.hubzero.public_dns
+  description = "ALB DNS name or empty when ALB is disabled"
+  value       = var.enable_alb ? aws_lb.hubzero[0].dns_name : ""
 }
 
 output "web_url" {
   description = "Web URL for the HubZero instance"
   value = (
+    var.enable_cdn && var.enable_alb ? "https://${aws_cloudfront_distribution.hubzero[0].domain_name}" :
     var.enable_alb && var.domain_name != "" ? "https://${var.domain_name}" :
     var.enable_alb ? "https://${aws_lb.hubzero[0].dns_name}" :
     var.domain_name != "" ? "https://${var.domain_name}" :
-    "http://${aws_instance.hubzero.public_ip}"
+    "(no public IP — use SSM to connect)"
   )
+}
+
+output "cloudfront_domain" {
+  description = "CloudFront distribution domain name (empty if CDN is disabled)"
+  value       = var.enable_cdn && var.enable_alb ? aws_cloudfront_distribution.hubzero[0].domain_name : ""
+}
+
+output "efs_id" {
+  description = "EFS file system ID (empty if EFS is disabled)"
+  value       = var.enable_efs ? aws_efs_file_system.hubzero[0].id : ""
 }
 
 output "alb_dns_name" {
@@ -56,8 +62,8 @@ output "db_secret_arn" {
 }
 
 output "ssm_connect_command" {
-  description = "Command to connect via SSM Session Manager"
-  value       = "aws ssm start-session --target ${aws_instance.hubzero.id}"
+  description = "Command to find the running instance and connect via SSM Session Manager"
+  value       = "aws ec2 describe-instances --filters 'Name=tag:aws:autoscaling:groupName,Values=${aws_autoscaling_group.hubzero.name}' 'Name=instance-state-name,Values=running' --query 'Reservations[0].Instances[0].InstanceId' --output text | xargs -I{} aws ssm start-session --target {}"
 }
 
 output "sns_topic_arn" {

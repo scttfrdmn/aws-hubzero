@@ -64,6 +64,8 @@ HUBZERO_ENABLE_MONITORING="${HUBZERO_ENABLE_MONITORING:-false}"
 HUBZERO_CW_LOG_GROUP_PREFIX="${HUBZERO_CW_LOG_GROUP_PREFIX:-/aws/ec2/hubzero}"
 HUBZERO_S3_BUCKET="${HUBZERO_S3_BUCKET:-}"
 HUBZERO_ENABLE_ALB="${HUBZERO_ENABLE_ALB:-false}"
+HUBZERO_EFS_ID="${HUBZERO_EFS_ID:-}"
+HUBZERO_EFS_ACCESS_POINT_ID="${HUBZERO_EFS_ACCESS_POINT_ID:-}"
 
 # Retrieve DB password: from Secrets Manager if ARN provided, else generate locally
 HUBZERO_DB_SECRET_ARN="${HUBZERO_DB_SECRET_ARN:-}"
@@ -84,6 +86,20 @@ echo "Domain: ${HUBZERO_DOMAIN}"
 echo "Database host: ${HUBZERO_DB_HOST}"
 echo "Use RDS: ${HUBZERO_USE_RDS}"
 echo "Install full platform: ${HUBZERO_INSTALL_PLATFORM}"
+
+###############################################################################
+# 0b. EFS mount (if configured) — mount before starting httpd
+###############################################################################
+if [ -n "${HUBZERO_EFS_ID}" ] && [ -n "${HUBZERO_EFS_ACCESS_POINT_ID}" ]; then
+    echo "=== Mounting EFS ${HUBZERO_EFS_ID} ==="
+    dnf install -y amazon-efs-utils
+    mkdir -p /var/www/hubzero
+    mount -t efs -o tls,iam,accesspoint="${HUBZERO_EFS_ACCESS_POINT_ID}" \
+      "${HUBZERO_EFS_ID}":/ /var/www/hubzero
+    # Persist across reboots
+    echo "${HUBZERO_EFS_ID}:/ /var/www/hubzero efs _netdev,tls,iam,accesspoint=${HUBZERO_EFS_ACCESS_POINT_ID} 0 0" >> /etc/fstab
+    echo "=== EFS mounted ==="
+fi
 
 ###############################################################################
 # 1. Start baked services (fail2ban, httpd, php-fpm are already installed/enabled

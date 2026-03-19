@@ -127,3 +127,27 @@ variable "enable_parameter_store" {
   default     = true
   description = "Store configuration in SSM Parameter Store and source at instance launch"
 }
+
+variable "enable_efs" {
+  type        = bool
+  default     = true
+  description = "Provision an EFS file system for shared web root"
+}
+
+variable "efs_subnet_ids" {
+  type        = list(string)
+  default     = []
+  description = "Subnet IDs for EFS mount targets (defaults to [var.subnet_id] when empty)"
+}
+
+variable "enable_cdn" {
+  type        = bool
+  default     = false
+  description = "Provision a CloudFront distribution in front of the ALB. Requires enable_alb=true."
+}
+
+variable "enable_cloudfront_waf" {
+  type        = bool
+  default     = false
+  description = "Attach a CLOUDFRONT-scoped WAF ACL to the CloudFront distribution (must be in us-east-1; requires a provider alias — see CHANGELOG for details)"
+}

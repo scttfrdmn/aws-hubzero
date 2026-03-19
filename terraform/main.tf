@@ -270,29 +270,9 @@ resource "aws_db_instance" "hubzero" {
   tags = { Name = "hubzero-${var.environment}" }
 }
 
-# --- EC2 ---
-resource "aws_instance" "hubzero" {
-  ami                         = local.selected_ami
-  instance_type               = local.config.instance_type
-  subnet_id                   = data.aws_subnet.selected.id
-  vpc_security_group_ids      = [aws_security_group.hubzero.id]
-  iam_instance_profile        = aws_iam_instance_profile.hubzero.name
-  key_name                    = var.key_name != "" ? var.key_name : null
-  associate_public_ip_address = var.environment == "test"
-  disable_api_termination     = var.environment == "prod"
-
-  metadata_options {
-    http_endpoint = "enabled"
-    http_tokens   = "required"
-  }
-
-  root_block_device {
-    volume_size = local.config.volume_size
-    volume_type = "gp3"
-    encrypted   = true
-  }
-
-  user_data = base64encode(join("\n", [
+# --- EC2: Launch Template + Auto Scaling Group (min=1) ---
+locals {
+  userdata_script = base64encode(join("\n", [
     "#!/usr/bin/env bash",
     "export HUBZERO_DOMAIN='${var.domain_name}'",
     "export HUBZERO_INSTALL_PLATFORM='${tostring(var.install_platform)}'",
@@ -308,13 +288,51 @@ resource "aws_instance" "hubzero" {
     "export HUBZERO_ENABLE_ALB='${tostring(var.enable_alb)}'",
     "export HUBZERO_ENVIRONMENT='${var.environment}'",
     "export HUBZERO_ENABLE_PARAMETER_STORE='${tostring(var.enable_parameter_store)}'",
+    "export HUBZERO_EFS_ID='${var.enable_efs ? aws_efs_file_system.hubzero[0].id : ""}'",
+    "export HUBZERO_EFS_ACCESS_POINT_ID='${var.enable_efs ? aws_efs_access_point.hubzero[0].id : ""}'",
     var.use_baked_ami ? "" : file("${path.module}/../scripts/bake.sh"),
     file("${path.module}/../scripts/userdata.sh"),
   ]))
+}
 
-  tags = {
-    Name          = "hubzero-${var.environment}"
-    "Patch Group" = "hubzero-${var.environment}"
+resource "aws_launch_template" "hubzero" {
+  name_prefix   = "hubzero-${var.environment}-"
+  image_id      = local.selected_ami
+  instance_type = local.config.instance_type
+  key_name      = var.key_name != "" ? var.key_name : null
+
+  iam_instance_profile { name = aws_iam_instance_profile.hubzero.name }
+
+  vpc_security_group_ids = [aws_security_group.hubzero.id]
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size           = local.config.volume_size
+      volume_type           = "gp3"
+      encrypted             = true
+      delete_on_termination = true
+    }
+  }
+
+  user_data = local.userdata_script
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name          = "hubzero-${var.environment}"
+      "Patch Group" = "hubzero-${var.environment}"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+    tags = { Name = "hubzero-${var.environment}" }
   }
 
   lifecycle {
@@ -331,6 +349,54 @@ resource "aws_instance" "hubzero" {
       error_message = "use_rds=false is not recommended for staging/prod. Set use_rds=true or acknowledge with environment=test."
     }
   }
+}
+
+resource "aws_autoscaling_group" "hubzero" {
+  name_prefix         = "hubzero-${var.environment}-"
+  vpc_zone_identifier = [data.aws_subnet.selected.id]
+  min_size            = 1
+  max_size            = 1
+  desired_capacity    = 1
+  health_check_type   = var.enable_alb ? "ELB" : "EC2"
+
+  launch_template {
+    id      = aws_launch_template.hubzero.id
+    version = "$Latest"
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 0
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "hubzero-${var.environment}"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "Project"
+    value               = "hubzero"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "Patch Group"
+    value               = "hubzero-${var.environment}"
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
+}
+
+# Attach ASG to ALB target group (replaces direct instance attachment)
+resource "aws_autoscaling_attachment" "hubzero" {
+  count                  = var.enable_alb ? 1 : 0
+  autoscaling_group_name = aws_autoscaling_group.hubzero.id
+  lb_target_group_arn    = aws_lb_target_group.hubzero[0].arn
 }
 
 # --- EBS Snapshot Lifecycle ---
@@ -430,9 +496,10 @@ resource "aws_cloudwatch_metric_alarm" "ec2_cpu" {
   statistic           = "Average"
   threshold           = local.mon.cpu_threshold
   alarm_description   = "EC2 CPU utilization above ${local.mon.cpu_threshold}%"
-  dimensions          = { InstanceId = aws_instance.hubzero.id }
-  alarm_actions       = [aws_sns_topic.hubzero[0].arn]
-  ok_actions          = [aws_sns_topic.hubzero[0].arn]
+  # ASG: EC2 namespace supports AutoScalingGroupName dimension
+  dimensions    = { AutoScalingGroupName = aws_autoscaling_group.hubzero.name }
+  alarm_actions = [aws_sns_topic.hubzero[0].arn]
+  ok_actions    = [aws_sns_topic.hubzero[0].arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "ec2_status" {
@@ -446,11 +513,16 @@ resource "aws_cloudwatch_metric_alarm" "ec2_status" {
   statistic           = "Maximum"
   threshold           = 0
   alarm_description   = "EC2 status check failed"
-  dimensions          = { InstanceId = aws_instance.hubzero.id }
+  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.hubzero.name }
   alarm_actions       = [aws_sns_topic.hubzero[0].arn]
   ok_actions          = [aws_sns_topic.hubzero[0].arn]
 }
 
+# NOTE: CWAgent publishes mem/disk metrics with InstanceId dimension. After moving
+# to ASG, these alarms require per-instance configuration (e.g. via EventBridge →
+# Lambda creating alarms on instance launch). For v0.6.0 the alarms are created
+# without an InstanceId filter; they will not fire automatically but document intent.
+# See CHANGELOG for details.
 resource "aws_cloudwatch_metric_alarm" "ec2_memory" {
   count               = var.enable_monitoring ? 1 : 0
   alarm_name          = "hubzero-${var.environment}-ec2-memory"
@@ -461,8 +533,8 @@ resource "aws_cloudwatch_metric_alarm" "ec2_memory" {
   period              = local.mon.alarm_period
   statistic           = "Average"
   threshold           = 80
-  alarm_description   = "EC2 memory usage above 80%"
-  dimensions          = { InstanceId = aws_instance.hubzero.id }
+  alarm_description   = "EC2 memory usage above 80% (requires per-instance alarm update post ASG launch)"
+  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.hubzero.name }
   alarm_actions       = [aws_sns_topic.hubzero[0].arn]
   ok_actions          = [aws_sns_topic.hubzero[0].arn]
 }
@@ -477,10 +549,10 @@ resource "aws_cloudwatch_metric_alarm" "ec2_disk" {
   period              = local.mon.alarm_period
   statistic           = "Average"
   threshold           = 85
-  alarm_description   = "EC2 disk usage above 85%"
+  alarm_description   = "EC2 disk usage above 85% (requires per-instance alarm update post ASG launch)"
   dimensions = {
-    InstanceId = aws_instance.hubzero.id
-    path       = "/"
+    AutoScalingGroupName = aws_autoscaling_group.hubzero.name
+    path                 = "/"
   }
   alarm_actions = [aws_sns_topic.hubzero[0].arn]
   ok_actions    = [aws_sns_topic.hubzero[0].arn]
@@ -679,13 +751,6 @@ resource "aws_lb_target_group" "hubzero" {
     unhealthy_threshold = 3
     interval            = 30
   }
-}
-
-resource "aws_lb_target_group_attachment" "hubzero" {
-  count            = var.enable_alb ? 1 : 0
-  target_group_arn = aws_lb_target_group.hubzero[0].arn
-  target_id        = aws_instance.hubzero.id
-  port             = 80
 }
 
 resource "aws_lb_listener" "http" {
@@ -1038,4 +1103,134 @@ resource "aws_iam_role_policy" "parameter_store" {
       Resource = "arn:aws:ssm:*:*:parameter/hubzero/${var.environment}/*"
     }]
   })
+}
+
+# --- EFS Shared Web Root (optional) ---
+resource "aws_efs_file_system" "hubzero" {
+  count            = var.enable_efs ? 1 : 0
+  encrypted        = true
+  performance_mode = "generalPurpose"
+
+  tags = { Name = "hubzero-${var.environment}" }
+}
+
+resource "aws_security_group" "efs" {
+  count       = var.enable_efs ? 1 : 0
+  name_prefix = "hubzero-efs-${var.environment}-"
+  description = "HubZero EFS ${var.environment}"
+  vpc_id      = data.aws_vpc.selected.id
+
+  ingress {
+    description     = "NFS from EC2"
+    from_port       = 2049
+    to_port         = 2049
+    protocol        = "tcp"
+    security_groups = [aws_security_group.hubzero.id]
+  }
+}
+
+locals {
+  efs_subnet_ids = length(var.efs_subnet_ids) > 0 ? var.efs_subnet_ids : [var.subnet_id]
+}
+
+resource "aws_efs_mount_target" "hubzero" {
+  count           = var.enable_efs ? length(local.efs_subnet_ids) : 0
+  file_system_id  = aws_efs_file_system.hubzero[0].id
+  subnet_id       = local.efs_subnet_ids[count.index]
+  security_groups = [aws_security_group.efs[0].id]
+}
+
+resource "aws_efs_access_point" "hubzero" {
+  count          = var.enable_efs ? 1 : 0
+  file_system_id = aws_efs_file_system.hubzero[0].id
+
+  posix_user {
+    uid = 48
+    gid = 48
+  }
+
+  root_directory {
+    path = "/hubzero"
+    creation_info {
+      owner_uid   = 48
+      owner_gid   = 48
+      permissions = "755"
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "efs" {
+  count = var.enable_efs ? 1 : 0
+  name  = "hubzero-efs"
+  role  = aws_iam_role.hubzero.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "elasticfilesystem:ClientMount",
+        "elasticfilesystem:ClientWrite",
+        "elasticfilesystem:ClientRootAccess"
+      ]
+      Resource = aws_efs_file_system.hubzero[0].arn
+    }]
+  })
+}
+
+# --- CloudFront CDN (optional, requires ALB) ---
+resource "aws_cloudfront_distribution" "hubzero" {
+  count   = var.enable_cdn && var.enable_alb ? 1 : 0
+  enabled = true
+  comment = "HubZero ${var.environment} CDN"
+
+  origin {
+    domain_name = aws_lb.hubzero[0].dns_name
+    origin_id   = "alb"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  # Static assets: long TTL (CachingOptimized managed policy)
+  dynamic "ordered_cache_behavior" {
+    for_each = ["/media/*", "/assets/*", "/css/*", "/js/*"]
+    content {
+      path_pattern           = ordered_cache_behavior.value
+      allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+      cached_methods         = ["GET", "HEAD"]
+      target_origin_id       = "alb"
+      compress               = true
+      viewer_protocol_policy = "redirect-to-https"
+      cache_policy_id        = "658327ea-f89d-4fab-a63d-7e88639e58f6"
+    }
+  }
+
+  # Dynamic content: pass-through (CachingDisabled managed policy)
+  default_cache_behavior {
+    allowed_methods        = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "alb"
+    compress               = true
+    viewer_protocol_policy = "redirect-to-https"
+    cache_policy_id        = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+  }
+
+  price_class = "PriceClass_100"
+
+  restrictions {
+    geo_restriction { restriction_type = "none" }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  # NOTE: To attach a WAF to CloudFront, the WAF ACL must be CLOUDFRONT-scoped
+  # and provisioned in us-east-1 (regardless of the stack region). This requires
+  # a separate provider alias. Enable enable_cloudfront_waf=true and configure a
+  # us-east-1 provider alias to use this feature — see CHANGELOG for details.
 }
