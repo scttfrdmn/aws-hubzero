@@ -6,16 +6,18 @@
   "certbotEmail": "",
   "installPlatform": "false",
 
-  "useRds": "true",
-  "enableS3Storage": "true",
-  "enableEfs": "true",
+  "deploymentProfile": "minimal",
 
-  "enableAlb": "true",
+  "useRds": "false",
+  "enableS3Storage": "true",
+  "enableEfs": "false",
+
+  "enableAlb": "false",
   "acmCertificateArn": "",
-  "enableWaf": "true",
+  "enableWaf": "false",
   "enableCdn": "false",
 
-  "enableVpcEndpoints": "true",
+  "enableVpcEndpoints": "false",
   "enableMonitoring": "true",
   "alarmEmail": "",
   "enableParameterStore": "true",

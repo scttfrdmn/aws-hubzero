@@ -26,12 +26,34 @@ interface HubzeroStackProps extends cdk.StackProps {
 
 const VALID_ENVIRONMENTS = ["test", "staging", "prod"];
 
-const ENV_CONFIG: Record<string, { instanceType: string; volumeSize: number }> =
-  {
-    test: { instanceType: "t3.xlarge", volumeSize: 100 },
-    staging: { instanceType: "m6i.2xlarge", volumeSize: 500 },
-    prod: { instanceType: "m6i.4xlarge", volumeSize: 1000 },
-  };
+const ENV_CONFIG: Record<string, { volumeSize: number }> = {
+  test: { volumeSize: 30 },
+  staging: { volumeSize: 100 },
+  prod: { volumeSize: 200 },
+};
+
+// Deployment profiles: minimal (default), graviton (ARM64, ~20% cheaper), spot (spot pricing).
+// spot requires useRds=true and enableEfs=true to survive interruptions.
+const PROFILE_CONFIG: Record<
+  string,
+  { instanceType: string; cpuArch: ec2.AmazonLinuxCpuType; useSpot: boolean }
+> = {
+  minimal: {
+    instanceType: "t3.medium",
+    cpuArch: ec2.AmazonLinuxCpuType.X86_64,
+    useSpot: false,
+  },
+  graviton: {
+    instanceType: "t4g.medium",
+    cpuArch: ec2.AmazonLinuxCpuType.ARM_64,
+    useSpot: false,
+  },
+  spot: {
+    instanceType: "t3.medium",
+    cpuArch: ec2.AmazonLinuxCpuType.X86_64,
+    useSpot: true,
+  },
+};
 
 const RDS_CONFIG: Record<
   string,
@@ -82,6 +104,18 @@ export class HubzeroStack extends cdk.Stack {
     }
 
     const config = ENV_CONFIG[props.environment];
+    const deploymentProfile =
+      this.node.tryGetContext("deploymentProfile") || "minimal";
+    if (!PROFILE_CONFIG[deploymentProfile]) {
+      throw new Error(
+        `deploymentProfile must be one of: minimal, graviton, spot (got "${deploymentProfile}")`
+      );
+    }
+    const profile = PROFILE_CONFIG[deploymentProfile];
+    // Allow instance_type context override (same as Terraform instance_type variable)
+    const instanceTypeOverride: string =
+      this.node.tryGetContext("instanceType") || "";
+    const ec2InstanceType = instanceTypeOverride || profile.instanceType;
     const vpcId = this.node.tryGetContext("vpcId");
     const keyName = this.node.tryGetContext("keyName") || "";
     const allowedCidr: string = this.node.tryGetContext("allowedCidr");
@@ -163,13 +197,20 @@ export class HubzeroStack extends cdk.Stack {
 
     // When useBakedAmi is enabled, look up a pre-baked HubZero AMI (built by
     // Packer). Falls back to the latest AL2023 base AMI if no baked image exists.
+    if (profile.useSpot && !(useRds && enableEfs)) {
+      throw new Error(
+        'deploymentProfile="spot" requires useRds=true and enableEfs=true to prevent data loss on spot interruption.'
+      );
+    }
+
     const ami = useBakedAmi
       ? ec2.MachineImage.lookup({
           name: "hubzero-base-*",
           owners: ["self"],
+          filters: { architecture: [profile.cpuArch === ec2.AmazonLinuxCpuType.ARM_64 ? "arm64" : "x86_64"] },
         })
       : ec2.MachineImage.latestAmazonLinux2023({
-          cpuType: ec2.AmazonLinuxCpuType.X86_64,
+          cpuType: profile.cpuArch,
         });
 
     // --- RDS (optional) ---
@@ -318,7 +359,7 @@ export class HubzeroStack extends cdk.Stack {
     const asg = new autoscaling.AutoScalingGroup(this, "ASG", {
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-      instanceType: new ec2.InstanceType(config.instanceType),
+      instanceType: new ec2.InstanceType(ec2InstanceType),
       machineImage: ami,
       securityGroup: sg,
       requireImdsv2: true,
@@ -341,19 +382,23 @@ export class HubzeroStack extends cdk.Stack {
       healthCheck: enableAlb
         ? autoscaling.HealthCheck.elb({ grace: cdk.Duration.minutes(5) })
         : autoscaling.HealthCheck.ec2(),
+      // spot profile: set a max bid well above typical spot price to ensure capacity.
+      // t3.medium on-demand is $0.0416/hr; spot typically runs $0.004–0.008/hr.
+      spotPrice: profile.useSpot ? "0.10" : undefined,
       // Instance refresh (rolling): use CfnAutoScalingGroup override since
       // AutoScalingGroupProps does not expose this directly in all CDK versions
-
       ssmSessionPermissions: true,
     });
     // Convenience alias — used in the sections below
     const instance = asg;
 
-    // Rolling instance refresh via CfnAutoScalingGroup property override
-    (asg.node.defaultChild as autoscaling.CfnAutoScalingGroup).addPropertyOverride(
-      "InstanceRefresh",
-      { Strategy: "Rolling", Preferences: { MinHealthyPercentage: 0 } }
-    );
+    const cfnAsg = asg.node.defaultChild as autoscaling.CfnAutoScalingGroup;
+
+    // Rolling instance refresh
+    cfnAsg.addPropertyOverride("InstanceRefresh", {
+      Strategy: "Rolling",
+      Preferences: { MinHealthyPercentage: 0 },
+    });
 
     cdk.Tags.of(asg).add("Patch Group", `hubzero-${props.environment}`);
 

@@ -7,6 +7,38 @@ Terraform or AWS CDK (TypeScript). Both tools produce identical infrastructure.
 > — it walks through account setup, CLI configuration, and finding the IDs you need
 > before running any deployment commands.
 
+## Deployment Profiles
+
+Choose a profile to match your cost and reliability needs. The profile sets the
+EC2 instance type and compute strategy; all other features (RDS, ALB, EFS, etc.)
+are controlled independently.
+
+| Profile | Instance | Arch | Pricing | Est. compute/mo | Best for |
+|---|---|---|---|---|---|
+| **`minimal`** *(default)* | t3.medium | x86_64 | On-demand | ~$30 | Development, small hubs |
+| **`graviton`** | t4g.medium | ARM64 | On-demand | ~$24 | Same as minimal, ~20% cheaper |
+| **`spot`** | t3.medium | x86_64 | Spot | ~$4–8 | Cost-sensitive; requires RDS + EFS |
+
+**Override the instance size without changing the profile:**
+
+```hcl
+# Terraform — use a larger instance when needed, keep all other profile settings
+deployment_profile = "minimal"
+instance_type      = "t3.large"
+```
+
+```bash
+# CDK
+npx cdk deploy -c deploymentProfile=minimal -c instanceType=t3.large
+```
+
+**Spot profile note:** when AWS reclaims a spot instance the ASG launches a
+replacement in ~3–5 minutes. Data survives because the web root lives on EFS and
+the database lives on RDS. The spot profile enforces both via a deploy-time
+precondition.
+
+---
+
 ## Architecture
 
 ```
@@ -94,11 +126,13 @@ bash scripts/bootstrap-terraform-backend.sh
 cd terraform
 terraform init
 
-# Edit environments/test.tfvars and add your required values:
+# Edit environments/test.tfvars and add your three required values:
 #   vpc_id       = "vpc-..."
 #   subnet_id    = "subnet-..."
 #   allowed_cidr = "YOUR_IP/32"
-#   rds_subnet_ids = ["subnet-aaa", "subnet-bbb"]  # 2 subnets in different AZs
+#
+# The test.tfvars already sets deployment_profile=minimal with the
+# cost-saving options (no RDS, no ALB, no VPC endpoints) — total ~$35/mo.
 
 terraform apply -var-file=environments/test.tfvars
 ```
@@ -109,7 +143,8 @@ terraform apply -var-file=environments/test.tfvars
 cd cdk
 npm install
 cp cdk.context.example.json cdk.context.json
-# Edit cdk.context.json with your vpcId, allowedCidr, etc.
+# Edit cdk.context.json: set vpcId and allowedCidr
+# The example already uses deploymentProfile=minimal with cost-saving defaults
 
 npx cdk bootstrap   # one-time per account/region
 npx cdk deploy -c environment=test
@@ -204,11 +239,14 @@ Bootstrap completes in roughly 3–5 minutes when using a pre-baked AMI, or
 
 ## Environments
 
-| Environment | Instance Type | EBS    | RDS Class        | RDS Storage | Multi-AZ |
-|-------------|---------------|--------|------------------|-------------|----------|
-| test        | t3.xlarge     | 100 GB | db.t3.medium     | 20 GB       | No       |
-| staging     | m6i.2xlarge   | 500 GB | db.r6g.xlarge    | 100 GB      | No       |
-| prod        | m6i.4xlarge   | 1000 GB| db.r6g.2xlarge   | 500 GB      | Yes      |
+Instance type is set by `deployment_profile` (default: t3.medium). Use
+`instance_type` to override. EBS volume and RDS sizing are per-environment:
+
+| Environment | EBS    | RDS Class (when `use_rds=true`) | RDS Storage | Multi-AZ |
+|-------------|--------|----------------------------------|-------------|----------|
+| test        | 30 GB  | db.t3.medium                     | 20 GB       | No       |
+| staging     | 100 GB | db.r6g.xlarge                    | 100 GB      | No       |
+| prod        | 200 GB | db.r6g.2xlarge                   | 500 GB      | Yes      |
 
 ## TLS / HTTPS
 
@@ -293,12 +331,14 @@ GIT_SHA=$(git rev-parse --short HEAD) packer build \
 
 | Variable | Default | Description |
 |---|---|---|
-| `use_baked_ami` | `true` | Prefer pre-baked `hubzero-base-*` AMI |
+| `deployment_profile` / `deploymentProfile` | `minimal` | `minimal`, `graviton`, or `spot` — see [Deployment Profiles](#deployment-profiles) |
+| `instance_type` / `instanceType` | `""` | Override the profile's instance size (e.g. `t3.large`) |
+| `use_baked_ami` / `useBakedAmi` | `true` | Prefer pre-baked `hubzero-base-*` AMI; auto-selects correct architecture |
 | `key_name` / `keyName` | `""` | EC2 key pair (optional; SSM is preferred) |
-| `use_rds` / `useRds` | `true` | RDS MariaDB (recommended); `false` = local DB (test only) |
+| `use_rds` / `useRds` | `true` | RDS MariaDB; `false` = local DB. Required `true` for `spot` profile |
 | `rds_subnet_ids` | `[]` | ≥2 subnet IDs in different AZs (required when `use_rds=true`) |
 | `enable_s3_storage` / `enableS3Storage` | `true` | S3 bucket for HubZero file uploads |
-| `enable_efs` / `enableEfs` | `true` | EFS shared web root |
+| `enable_efs` / `enableEfs` | `true` | EFS shared web root. Required `true` for `spot` profile |
 | `efs_subnet_ids` | `[]` | EFS mount target subnets (defaults to `subnet_id`) |
 
 ### Security
@@ -400,20 +440,29 @@ aws efs describe-mount-targets --file-system-id <efs-id> \
 
 ## Cost Estimate
 
-Approximate monthly costs for a test deployment in us-east-1 (on-demand pricing):
+Costs in us-east-1 (on-demand pricing). Profile determines the EC2 cost;
+other services are the same across profiles.
 
-| Resource | test | staging | prod |
+### By deployment profile (test environment, minimal services)
+
+| Profile | EC2 | Local MariaDB | No ALB | No VPC endpoints | **Total** |
+|---|---|---|---|---|---|
+| `minimal` (t3.medium) | ~$30/mo | $0 | $0 | $0 | **~$35/mo** |
+| `graviton` (t4g.medium) | ~$24/mo | $0 | $0 | $0 | **~$29/mo** |
+| `spot` (t3.medium spot) | ~$5/mo | — | — | — | **~$65/mo** (spot + RDS + EFS required) |
+
+### Full production stack (all features enabled)
+
+| Resource | minimal | graviton | spot |
 |---|---|---|---|
-| EC2 (t3.xlarge / m6i.2xl / m6i.4xl) | ~$120 | ~$280 | ~$560 |
-| RDS (db.t3.medium / r6g.xl / r6g.2xl) | ~$55 | ~$370 | ~$740 |
-| ALB | ~$20 | ~$20 | ~$20 |
-| EFS (10 GB) | ~$3 | ~$3 | ~$3 |
-| S3 + CloudWatch | ~$5 | ~$10 | ~$20 |
-| VPC endpoints (5 interface) | ~$35 | ~$35 | ~$35 |
-| **Total (approx.)** | **~$240/mo** | **~$720/mo** | **~$1,380/mo** |
+| EC2 | ~$30/mo | ~$24/mo | ~$5/mo |
+| RDS db.r6g.2xlarge (Multi-AZ, prod) | ~$740/mo | ~$740/mo | ~$740/mo |
+| ALB | ~$20/mo | ~$20/mo | ~$20/mo |
+| EFS (10 GB) | ~$3/mo | ~$3/mo | ~$3/mo |
+| S3 + CloudWatch | ~$15/mo | ~$15/mo | ~$15/mo |
+| VPC endpoints (5 interface) | ~$35/mo | ~$35/mo | ~$35/mo |
+| **Total** | **~$843/mo** | **~$837/mo** | **~$818/mo** |
 
-Set `enable_vpc_endpoints=false` and `enable_alb=false` in a test environment
-to reduce the cost to under $200/month.
-
-Use [AWS Pricing Calculator](https://calculator.aws) for precise estimates based
-on your region, data transfer, and traffic patterns.
+For a typical small research hub the RDS instance can be sized down significantly
+(db.t3.medium at ~$55/mo instead of db.r6g.2xlarge). Use
+[AWS Pricing Calculator](https://calculator.aws) for precise estimates.

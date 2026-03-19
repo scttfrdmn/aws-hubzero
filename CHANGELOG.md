@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-03-18
+
+### Added
+- **Deployment profiles** — new `deployment_profile` variable (`minimal` | `graviton` | `spot`; default: `minimal`) replacing hardcoded per-environment instance types
+  - `minimal`: t3.medium x86_64 on-demand (~$30/mo compute). Default for all environments.
+  - `graviton`: t4g.medium ARM64 on-demand (~$24/mo compute). AL2023, Apache, PHP, and MariaDB all run on ARM64; ~20% cheaper for equivalent workloads.
+  - `spot`: t3.medium x86_64 spot pricing (~$4–8/mo compute). Enforces `use_rds=true` and `enable_efs=true` via precondition to prevent data loss on interruption.
+  - New `instance_type` variable overrides the profile's default instance size without changing other profile settings
+- **AMI architecture awareness** — AL2023 AMI filter now parameterised on `local.cpu_arch` (`x86_64` / `arm64`); baked AMI filter adds architecture tag to prevent cross-arch mismatch
+
+### Changed
+- `env_config` volume sizes reduced to reflect realistic needs: test 30 GB (was 100), staging 100 GB (was 500), prod 200 GB (was 1000)
+- `test.tfvars` now explicitly sets `deployment_profile=minimal`, `use_rds=false`, `enable_alb=false`, `enable_vpc_endpoints=false`, `enable_waf=false`, `enable_efs=false` — represents the cheapest viable deployment (~$30–35/mo)
+- ASG switches from `launch_template` block to `mixed_instances_policy` block — enables spot support while preserving on-demand behaviour for minimal/graviton profiles
+- CDK: `ENV_CONFIG` drops `instanceType` (now from `PROFILE_CONFIG`); `deploymentProfile` context variable added; ARM64 machine image selected automatically for graviton profile; spot profile sets `spotPrice` on the ASG
+- `cdk.context.example.json`: `deploymentProfile: "minimal"` added as default; defaults lean toward minimal-cost options (`useRds: "false"`, `enableAlb: "false"`, `enableVpcEndpoints: "false"`)
+
 ## [0.6.0] - 2026-03-18
 
 ### Added
@@ -143,7 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PHP hardening, Docker user namespace remapping, Composer integrity checks,
   encrypted EBS and RDS at rest, Secrets Manager for RDS credentials
 
-[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.3.0...v0.4.0

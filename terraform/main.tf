@@ -25,10 +25,21 @@ provider "aws" {
 }
 
 locals {
+  # Deployment profile → compute defaults.
+  # instance_type var overrides the profile default when set.
+  profile_config = {
+    minimal  = { instance_type = "t3.medium",  cpu_arch = "x86_64", use_spot = false }
+    graviton = { instance_type = "t4g.medium", cpu_arch = "arm64",  use_spot = false }
+    spot     = { instance_type = "t3.medium",  cpu_arch = "x86_64", use_spot = true }
+  }
+  cpu_arch          = local.profile_config[var.deployment_profile].cpu_arch
+  use_spot          = local.profile_config[var.deployment_profile].use_spot
+  ec2_instance_type = var.instance_type != "" ? var.instance_type : local.profile_config[var.deployment_profile].instance_type
+
   env_config = {
-    test    = { instance_type = "t3.xlarge", volume_size = 100 }
-    staging = { instance_type = "m6i.2xlarge", volume_size = 500 }
-    prod    = { instance_type = "m6i.4xlarge", volume_size = 1000 }
+    test    = { volume_size = 30 }
+    staging = { volume_size = 100 }
+    prod    = { volume_size = 200 }
   }
   rds_config = {
     test    = { instance_class = "db.t3.medium", storage = 20, multi_az = false }
@@ -52,15 +63,20 @@ data "aws_ami" "al2023" {
   owners      = ["137112412989"]
   filter {
     name   = "name"
-    values = ["al2023-ami-2023.*-x86_64"]
+    values = ["al2023-ami-2023.*-${local.cpu_arch}"]
   }
   filter {
     name   = "virtualization-type"
     values = ["hvm"]
   }
+  filter {
+    name   = "architecture"
+    values = [local.cpu_arch]
+  }
 }
 
-# Baked HubZero AMI (built by Packer); falls back to AL2023 when not found
+# Baked HubZero AMI (built by Packer); falls back to AL2023 when not found.
+# Packer bakes per-arch AMIs — filter by architecture to avoid cross-arch mismatch.
 data "aws_ami" "hubzero_baked" {
   count       = var.use_baked_ami ? 1 : 0
   most_recent = true
@@ -68,6 +84,10 @@ data "aws_ami" "hubzero_baked" {
   filter {
     name   = "name"
     values = ["hubzero-base-*"]
+  }
+  filter {
+    name   = "architecture"
+    values = [local.cpu_arch]
   }
 }
 
@@ -298,7 +318,7 @@ locals {
 resource "aws_launch_template" "hubzero" {
   name_prefix   = "hubzero-${var.environment}-"
   image_id      = local.selected_ami
-  instance_type = local.config.instance_type
+  instance_type = local.ec2_instance_type
   key_name      = var.key_name != "" ? var.key_name : null
 
   iam_instance_profile { name = aws_iam_instance_profile.hubzero.name }
@@ -359,9 +379,20 @@ resource "aws_autoscaling_group" "hubzero" {
   desired_capacity    = 1
   health_check_type   = var.enable_alb ? "ELB" : "EC2"
 
-  launch_template {
-    id      = aws_launch_template.hubzero.id
-    version = "$Latest"
+  # mixed_instances_policy handles both on-demand (minimal/graviton) and spot profiles.
+  # For on-demand: on_demand_percentage=100. For spot: on_demand_percentage=0.
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_base_capacity                  = local.use_spot ? 0 : 1
+      on_demand_percentage_above_base_capacity = local.use_spot ? 0 : 100
+      spot_allocation_strategy                 = "capacity-optimized"
+    }
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.hubzero.id
+        version            = "$Latest"
+      }
+    }
   }
 
   instance_refresh {
@@ -388,6 +419,10 @@ resource "aws_autoscaling_group" "hubzero" {
   }
 
   lifecycle {
+    precondition {
+      condition     = !local.use_spot || (var.use_rds && var.enable_efs)
+      error_message = "deployment_profile=\"spot\" requires use_rds=true and enable_efs=true to prevent data loss on spot interruption."
+    }
     ignore_changes = [desired_capacity]
   }
 }

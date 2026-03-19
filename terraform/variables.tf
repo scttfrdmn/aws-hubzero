@@ -151,3 +151,27 @@ variable "enable_cloudfront_waf" {
   default     = false
   description = "Attach a CLOUDFRONT-scoped WAF ACL to the CloudFront distribution (must be in us-east-1; requires a provider alias — see CHANGELOG for details)"
 }
+
+variable "deployment_profile" {
+  type        = string
+  default     = "minimal"
+  description = <<-EOT
+    Compute cost profile:
+      minimal  — t3.medium x86_64 on-demand (~$30/mo). Default. Local MariaDB, certbot TLS.
+      graviton — t4g.medium ARM64 on-demand (~$24/mo). Same as minimal, ~20% cheaper.
+      spot     — t3.medium x86_64 spot pricing (~$4–8/mo compute). Requires use_rds=true
+                 and enable_efs=true so data survives spot interruptions.
+    Any profile can be combined with the individual feature toggles (enable_alb, use_rds, etc.).
+    Use instance_type to override the profile's default instance size.
+  EOT
+  validation {
+    condition     = contains(["minimal", "graviton", "spot"], var.deployment_profile)
+    error_message = "deployment_profile must be one of: minimal, graviton, spot."
+  }
+}
+
+variable "instance_type" {
+  type        = string
+  default     = ""
+  description = "Override the EC2 instance type set by deployment_profile (e.g. \"t3.large\"). Leave empty to use the profile default."
+}

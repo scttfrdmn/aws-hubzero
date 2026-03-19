@@ -375,41 +375,24 @@ check will pass and the load balancer will start forwarding traffic.
 These are rough on-demand estimates for `us-east-1`. Actual costs depend on
 traffic volume, data transfer, and any savings plans or reserved instances.
 
-| Resource | test (~$) | Notes |
+The default `deployment_profile=minimal` with the cost-saving options in
+`test.tfvars` gives you:
+
+| Resource | Cost | Notes |
 |---|---|---|
-| EC2 t3.xlarge | 120/mo | Stopped = no charge; EBS still billed |
-| RDS db.t3.medium | 55/mo | Cannot be stopped indefinitely |
-| ALB | 20/mo | Fixed + per-LCU |
-| EFS (10 GB) | 3/mo | Pay for storage used |
-| S3 + CloudWatch | 5/mo | Minimal for low traffic |
-| VPC endpoints × 5 | 35/mo | ~$7/each for interface endpoints |
-| **Total** | **~$240/mo** | |
+| EC2 t3.medium (minimal profile) | ~$30/mo | |
+| Local MariaDB (`use_rds=false`) | $0 | Included on EC2 |
+| EBS 30 GB gp3 | ~$2.40/mo | |
+| S3 + CloudWatch | ~$3/mo | |
+| **Total** | **~$35/mo** | |
 
-**To minimize cost during evaluation:**
+To go even cheaper, use the `graviton` profile (t4g.medium ARM64, ~$24/mo
+compute) — total ~$29/month.
 
-- Set `enable_vpc_endpoints=false` — saves ~$35/month; SSM access still works
-  via the internet NAT (you will need to allow outbound HTTPS on the EC2 SG).
-- Set `enable_alb=false` — saves ~$20/month; HTTP only, no TLS.
-- Use `use_rds=false` with `environment=test` — runs MariaDB locally on EC2;
-  saves ~$55/month.
-
-Minimum test configuration (no ALB, no RDS, no VPC endpoints):
-
-```hcl
-enable_alb          = false
-use_rds             = false
-enable_vpc_endpoints = false
-enable_waf          = false
-enable_efs          = false
-enable_s3_storage   = false
-enable_monitoring   = false
-enable_parameter_store = false
-enable_patch_manager   = false
-environment         = "test"
-```
-
-This runs a single EC2 t3.xlarge instance with local MariaDB for roughly
-**$120/month**.
+The `spot` profile gets EC2 compute down to ~$4–8/month but requires
+`use_rds=true` and `enable_efs=true`, which adds ~$58/month, for a total of
+~$65/month. Worth it for longer-running deployments where spot interruptions
+(3–5 min downtime) are tolerable.
 
 ---
 
