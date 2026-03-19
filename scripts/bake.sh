@@ -121,7 +121,7 @@ chown apache:apache /var/www/hubzero
 cd /var/www/hubzero
 
 if [ ! -f composer.json ]; then
-    sudo -u apache git clone --branch 2.4 \
+    sudo -u apache git clone --branch 2.4-main \
       https://github.com/hubzero/hubzero-cms.git .
     sudo -u apache composer install --no-dev --no-scripts --optimize-autoloader
 fi
