@@ -141,15 +141,14 @@ if [[ "${HUBZERO_ENABLE_ALB}" != "true" && -n "${HUBZERO_DOMAIN}" && ! "${HUBZER
 fi
 
 ###############################################################################
-# 3. MariaDB 10.11 (local install, skipped when using RDS)
+# 3. MariaDB (local install, skipped when using RDS)
 ###############################################################################
 if [ "${HUBZERO_USE_RDS}" = "true" ]; then
     echo "=== Skipping local MariaDB install (using RDS at ${HUBZERO_DB_HOST}) ==="
 else
-    # AL2023: MariaDB community repo (bake.sh installs client; add server here)
+    # AL2023 ships mariadb105-server natively
     if ! systemctl is-active --quiet mariadb; then
-        # MariaDB repo already configured by bake.sh
-        dnf install -y MariaDB-server
+        dnf install -y mariadb105-server
         systemctl enable --now mariadb
     fi
 

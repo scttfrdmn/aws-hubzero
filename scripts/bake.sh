@@ -70,12 +70,11 @@ cat > /etc/httpd/conf.d/hubzero.conf <<'APACHECONF'
 APACHECONF
 
 ###############################################################################
-# 3. MariaDB community client (server install is skipped at bake time —
+# 3. MariaDB client (server install is skipped at bake time —
 #    either RDS is used or MariaDB server is installed at launch)
+# AL2023 ships mariadb105 natively; no community repo needed for client-only.
 ###############################################################################
-curl -sS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
-  | bash -s -- --mariadb-server-version=mariadb-10.11
-dnf install -y MariaDB-client
+dnf install -y mariadb105
 
 ###############################################################################
 # 4. PHP 8.2
