@@ -292,27 +292,36 @@ resource "aws_db_instance" "hubzero" {
 
 # --- EC2: Launch Template + Auto Scaling Group (min=1) ---
 locals {
-  userdata_script = base64encode(join("\n", [
-    "#!/usr/bin/env bash",
-    "export HUBZERO_DOMAIN='${var.domain_name}'",
-    "export HUBZERO_INSTALL_PLATFORM='${tostring(var.install_platform)}'",
-    "export HUBZERO_USE_RDS='${tostring(var.use_rds)}'",
-    "export HUBZERO_DB_HOST='${local.db_host}'",
-    "export HUBZERO_DB_NAME='hubzero'",
-    "export HUBZERO_DB_USER='hubzero'",
-    "export HUBZERO_DB_SECRET_ARN='${var.use_rds ? aws_db_instance.hubzero[0].master_user_secret[0].secret_arn : ""}'",
-    "export HUBZERO_CERTBOT_EMAIL='${var.certbot_email}'",
-    "export HUBZERO_ENABLE_MONITORING='${tostring(var.enable_monitoring)}'",
-    "export HUBZERO_CW_LOG_GROUP_PREFIX='/aws/ec2/hubzero-${var.environment}'",
-    "export HUBZERO_S3_BUCKET='${var.enable_s3_storage ? aws_s3_bucket.hubzero[0].id : ""}'",
-    "export HUBZERO_ENABLE_ALB='${tostring(var.enable_alb)}'",
-    "export HUBZERO_ENVIRONMENT='${var.environment}'",
-    "export HUBZERO_ENABLE_PARAMETER_STORE='${tostring(var.enable_parameter_store)}'",
-    "export HUBZERO_EFS_ID='${var.enable_efs ? aws_efs_file_system.hubzero[0].id : ""}'",
-    "export HUBZERO_EFS_ACCESS_POINT_ID='${var.enable_efs ? aws_efs_access_point.hubzero[0].id : ""}'",
-    var.use_baked_ami ? "" : file("${path.module}/../scripts/bake.sh"),
-    file("${path.module}/../scripts/userdata.sh"),
-  ]))
+  # Scripts are fetched from GitHub at launch rather than embedded, keeping
+  # user data well under the 16 KB EC2 limit regardless of script size.
+  # HUBZERO_SCRIPTS_BRANCH lets you pin to a tag or test a branch.
+  userdata_script = base64encode(<<-USERDATA
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export HUBZERO_DOMAIN='${var.domain_name}'
+    export HUBZERO_INSTALL_PLATFORM='${tostring(var.install_platform)}'
+    export HUBZERO_USE_RDS='${tostring(var.use_rds)}'
+    export HUBZERO_DB_HOST='${local.db_host}'
+    export HUBZERO_DB_NAME='hubzero'
+    export HUBZERO_DB_USER='hubzero'
+    export HUBZERO_DB_SECRET_ARN='${var.use_rds ? aws_db_instance.hubzero[0].master_user_secret[0].secret_arn : ""}'
+    export HUBZERO_CERTBOT_EMAIL='${var.certbot_email}'
+    export HUBZERO_ENABLE_MONITORING='${tostring(var.enable_monitoring)}'
+    export HUBZERO_CW_LOG_GROUP_PREFIX='/aws/ec2/hubzero-${var.environment}'
+    export HUBZERO_S3_BUCKET='${var.enable_s3_storage ? aws_s3_bucket.hubzero[0].id : ""}'
+    export HUBZERO_ENABLE_ALB='${tostring(var.enable_alb)}'
+    export HUBZERO_ENVIRONMENT='${var.environment}'
+    export HUBZERO_ENABLE_PARAMETER_STORE='${tostring(var.enable_parameter_store)}'
+    export HUBZERO_EFS_ID='${var.enable_efs ? aws_efs_file_system.hubzero[0].id : ""}'
+    export HUBZERO_EFS_ACCESS_POINT_ID='${var.enable_efs ? aws_efs_access_point.hubzero[0].id : ""}'
+
+    BRANCH="$${HUBZERO_SCRIPTS_BRANCH:-main}"
+    BASE_URL="https://raw.githubusercontent.com/scttfrdmn/aws-hubzero/$${BRANCH}/scripts"
+
+    ${var.use_baked_ami ? "# Baked AMI — bake.sh already applied at image build time" : "curl -fsSL \"$${BASE_URL}/bake.sh\" | bash"}
+    curl -fsSL "$${BASE_URL}/userdata.sh" | bash
+  USERDATA
+  )
 }
 
 resource "aws_launch_template" "hubzero" {
@@ -1043,6 +1052,8 @@ resource "aws_ssm_maintenance_window_task" "patch" {
   task_arn         = "AWS-RunPatchBaseline"
   priority         = 1
   service_role_arn = aws_iam_role.hubzero.arn
+  max_concurrency  = "1"
+  max_errors       = "1"
 
   targets {
     key    = "WindowTargetIds"

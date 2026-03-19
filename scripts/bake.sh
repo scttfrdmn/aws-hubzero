@@ -11,9 +11,10 @@ echo "=== HubZero bake started at $(date) ==="
 # 1. System updates & base packages
 ###############################################################################
 dnf -y update
-# AL2023: fail2ban and other tools available in standard repos
-dnf -y install vim wget curl unzip git tar policycoreutils-python-utils \
-  cronie logrotate jq fail2ban amazon-cloudwatch-agent
+# AL2023 ships curl-minimal; --allowerasing replaces it with full curl.
+dnf -y install --allowerasing vim wget curl unzip git tar \
+  policycoreutils-python-utils cronie logrotate jq fail2ban \
+  amazon-cloudwatch-agent
 
 ###############################################################################
 # 1a. fail2ban (apache jails only — SSH port is not exposed)

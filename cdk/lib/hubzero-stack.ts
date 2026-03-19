@@ -16,8 +16,6 @@ import * as snsSubscriptions from "aws-cdk-lib/aws-sns-subscriptions";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as cloudwatchActions from "aws-cdk-lib/aws-cloudwatch-actions";
 import * as logs from "aws-cdk-lib/aws-logs";
-import { readFileSync } from "fs";
-import { join } from "path";
 import { Construct } from "constructs";
 
 interface HubzeroStackProps extends cdk.StackProps {
@@ -327,13 +325,14 @@ export class HubzeroStack extends cdk.Stack {
     }
 
     // --- User Data ---
+    // Scripts are fetched from GitHub at launch to stay under the 16 KB EC2
+    // user data limit. Set HUBZERO_SCRIPTS_BRANCH to pin to a tag/branch.
     const userData = ec2.UserData.forLinux();
-    const script = readFileSync(
-      join(__dirname, "../../scripts/userdata.sh"),
-      "utf-8"
-    );
+    const scriptsBranch =
+      this.node.tryGetContext("scriptsBranch") || "main";
+    const baseUrl = `https://raw.githubusercontent.com/scttfrdmn/aws-hubzero/${scriptsBranch}/scripts`;
 
-    const envExports = [
+    userData.addCommands(
       `export HUBZERO_DOMAIN="${domainName}"`,
       `export HUBZERO_CERTBOT_EMAIL="${certbotEmail}"`,
       `export HUBZERO_INSTALL_PLATFORM="${installPlatform}"`,
@@ -350,10 +349,11 @@ export class HubzeroStack extends cdk.Stack {
       `export HUBZERO_ENABLE_PARAMETER_STORE="${enableParameterStore}"`,
       `export HUBZERO_EFS_ID="${efsId}"`,
       `export HUBZERO_EFS_ACCESS_POINT_ID="${efsAccessPointId}"`,
-    ];
-
-    userData.addCommands(...envExports);
-    userData.addCommands(script);
+      useBakedAmi
+        ? "# Baked AMI — bake.sh already applied at image build time"
+        : `curl -fsSL "${baseUrl}/bake.sh" | bash`,
+      `curl -fsSL "${baseUrl}/userdata.sh" | bash`,
+    );
 
     // --- Auto Scaling Group (min=1) ---
     const asg = new autoscaling.AutoScalingGroup(this, "ASG", {
