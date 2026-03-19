@@ -58,8 +58,8 @@ HEADERSCONF
 
 cat > /etc/httpd/conf.d/hubzero.conf <<'APACHECONF'
 <VirtualHost *:80>
-    DocumentRoot /var/www/hubzero/public
-    <Directory /var/www/hubzero/public>
+    DocumentRoot /var/www/hubzero
+    <Directory /var/www/hubzero>
         Options -Indexes +SymLinksIfOwnerMatch
         AllowOverride All
         Require all granted
@@ -100,11 +100,13 @@ PHPINI
 systemctl enable php-fpm
 
 ###############################################################################
-# 5. HubZero CMS v2.4 (Composer-based install)
+# 5. HubZero CMS v2.4
 ###############################################################################
 # Ensure HOME is set — cloud-init may run with a minimal environment
 export HOME="${HOME:-/root}"
 export COMPOSER_HOME="${COMPOSER_HOME:-/root/.composer}"
+
+# Install Composer (needed for core/ dependencies)
 EXPECTED_CHECKSUM="$(php -r 'copy("https://composer.github.io/installer.sig", "php://stdout");')"
 php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
 ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
@@ -118,12 +120,18 @@ rm composer-setup.php
 
 mkdir -p /var/www/hubzero
 chown apache:apache /var/www/hubzero
-cd /var/www/hubzero
 
-if [ ! -f composer.json ]; then
-    sudo -u apache git clone --branch 2.4-main \
-      https://github.com/hubzero/hubzero-cms.git .
-    sudo -u apache composer install --no-dev --no-scripts --optimize-autoloader
+if [ ! -f /var/www/hubzero/index.php ]; then
+    sudo -u apache git clone --depth 1 --branch 2.4-main \
+      https://github.com/hubzero/hubzero-cms.git /var/www/hubzero
+fi
+
+# Install PHP dependencies in core/
+if [ -f /var/www/hubzero/core/composer.json ] && \
+   [ ! -d /var/www/hubzero/core/vendor ]; then
+    sudo -u apache HOME=/var/www/hubzero \
+      composer install --working-dir=/var/www/hubzero/core \
+      --no-dev --no-scripts --optimize-autoloader
 fi
 
 chown -R apache:apache /var/www/hubzero
