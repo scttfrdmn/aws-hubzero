@@ -21,7 +21,8 @@ to the [Prerequisites section of the README](../README.md#prerequisites).
 7. [Understand what this deployment creates](#7-understand-what-this-deployment-creates)
 8. [Estimated costs](#8-estimated-costs)
 9. [Common first-timer mistakes](#9-common-first-timer-mistakes)
-10. [Next step: deploy](#10-next-step-deploy)
+10. [Monitoring your deployment](#10-monitoring-your-deployment)
+11. [Next step: deploy](#11-next-step-deploy)
 
 ---
 
@@ -460,7 +461,74 @@ a rule to `COUNT` mode in the AWS Console to diagnose false positives.
 
 ---
 
-## 10. Next step: deploy
+## 10. Monitoring your deployment
+
+`terraform apply` creates the AWS infrastructure in **2–3 minutes**, but the
+EC2 instance then bootstraps in the background. With the default `minimal` profile
+(no baked AMI), **expect 10–15 minutes** before HubZero is reachable.
+
+### What's happening during that time
+
+1. The Auto Scaling Group launches an EC2 instance
+2. User data runs: exports env vars, then fetches `bake.sh` and `userdata.sh` from GitHub
+3. `bake.sh` installs Apache, PHP 8.2, MariaDB client, Composer, and clones HubZero CMS (~8–12 min)
+4. `userdata.sh` configures the environment, wires the database, starts services (~1–2 min)
+
+### Commands to follow along
+
+```bash
+# Find the instance launched by your ASG
+ASG_NAME=$(terraform -chdir=terraform output -raw asg_name)
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:aws:autoscaling:groupName,Values=${ASG_NAME}" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text)
+echo "Instance: $INSTANCE_ID"
+
+# Check instance state and public IP
+aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].[State.Name,PublicIpAddress,LaunchTime]' \
+  --output table
+
+# Wait ~60–90 seconds for SSM agent to register, then run a log check
+aws ssm send-command \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["tail -100 /var/log/cloud-init-output.log"]' \
+  --output text --query 'Command.CommandId'
+
+# Retrieve the output (replace COMMAND_ID with the ID printed above)
+aws ssm get-command-invocation \
+  --command-id COMMAND_ID --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' --output text
+```
+
+You can also open a live shell (requires the [SSM Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)):
+
+```bash
+aws ssm start-session --target "$INSTANCE_ID"
+
+# Inside the session — follow each log in sequence:
+sudo tail -f /var/log/cloud-init-output.log   # overall cloud-init progress
+sudo tail -f /var/log/hubzero-bake.log        # package install phase
+sudo tail -f /var/log/hubzero-userdata.log    # configuration phase
+```
+
+### Success indicators
+
+Bootstrap is complete when you see:
+
+```
+=== HubZero bootstrap completed at <timestamp> ===
+```
+
+At that point, HubZero is reachable at:
+- Without ALB: `http://<public-ip>/` (port 80)
+- With ALB: `https://<your-domain>/`
+
+---
+
+## 11. Next step: deploy
 
 Once you have:
 

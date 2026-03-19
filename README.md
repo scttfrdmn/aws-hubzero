@@ -137,6 +137,11 @@ terraform init
 terraform apply -var-file=environments/test.tfvars
 ```
 
+> **Deployment takes 10–15 minutes.** `terraform apply` itself finishes in 2–3 minutes
+> (infrastructure created), but the EC2 instance then bootstraps in the background —
+> downloading packages, installing PHP/Apache, and cloning HubZero. See
+> [Monitoring the bootstrap](#monitoring-the-bootstrap) below.
+
 ### CDK
 
 ```bash
@@ -207,6 +212,60 @@ npx cdk deploy -c environment=test
 npx cdk deploy -c environment=staging -c domainName=hub.example.com
 npx cdk deploy -c environment=prod    -c domainName=hub.example.com \
                                        -c alarmEmail=ops@example.com
+```
+
+## Monitoring the Bootstrap
+
+After `terraform apply` completes, the EC2 instance bootstraps in the background.
+**Total time: 10–15 minutes** (from base AL2023 AMI). You can watch progress with:
+
+```bash
+# 1. Find the instance ID launched by the ASG
+ASG_NAME=$(terraform -chdir=terraform output -raw asg_name)
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:aws:autoscaling:groupName,Values=${ASG_NAME}" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text)
+echo "Instance: $INSTANCE_ID"
+
+# 2. Wait for SSM to become available (~60–90 seconds after launch), then stream logs
+aws ssm send-command \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["tail -f /var/log/cloud-init-output.log"]' \
+  --output text --query 'Command.CommandId'
+
+# Then poll the command output (replace COMMAND_ID):
+aws ssm get-command-invocation \
+  --command-id COMMAND_ID --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' --output text
+```
+
+Or for a live-streaming session (requires the SSM Session Manager plugin):
+
+```bash
+aws ssm start-session --target "$INSTANCE_ID"
+# Inside the session:
+sudo tail -f /var/log/cloud-init-output.log
+sudo tail -f /var/log/hubzero-bake.log      # package install phase
+sudo tail -f /var/log/hubzero-userdata.log  # configuration phase
+```
+
+Bootstrap is complete when you see:
+```
+=== HubZero bootstrap completed at <timestamp> ===
+```
+
+To check instance health at a glance:
+```bash
+# Instance state
+aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].[State.Name,PublicIpAddress]' --output table
+
+# SSM connectivity (should show "Online")
+aws ssm describe-instance-information \
+  --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+  --query 'InstanceInformationList[0].PingStatus' --output text
 ```
 
 ## Instance Access
