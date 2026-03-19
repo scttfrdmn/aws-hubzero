@@ -5,8 +5,21 @@
   "domainName": "",
   "certbotEmail": "",
   "installPlatform": "false",
+
   "useRds": "true",
   "enableS3Storage": "true",
+  "enableEfs": "true",
+
+  "enableAlb": "true",
+  "acmCertificateArn": "",
+  "enableWaf": "true",
+  "enableCdn": "false",
+
+  "enableVpcEndpoints": "true",
   "enableMonitoring": "true",
-  "alarmEmail": ""
+  "alarmEmail": "",
+  "enableParameterStore": "true",
+  "enablePatchManager": "true",
+
+  "useBakedAmi": "true"
 }
