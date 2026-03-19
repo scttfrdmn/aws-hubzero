@@ -35,18 +35,24 @@ locals {
     staging = { instance_class = "db.r6g.xlarge", storage = 100, multi_az = false }
     prod    = { instance_class = "db.r6g.2xlarge", storage = 500, multi_az = true }
   }
+  monitoring_config = {
+    test    = { log_retention = 7, cpu_threshold = 80, alarm_period = 300, eval_periods = 2 }
+    staging = { log_retention = 14, cpu_threshold = 75, alarm_period = 300, eval_periods = 2 }
+    prod    = { log_retention = 30, cpu_threshold = 70, alarm_period = 60, eval_periods = 3 }
+  }
   config  = local.env_config[var.environment]
   rds     = local.rds_config[var.environment]
+  mon     = local.monitoring_config[var.environment]
   db_host = var.use_rds ? aws_db_instance.hubzero[0].address : "localhost"
 }
 
 # --- AMI ---
-data "aws_ami" "rocky8" {
+data "aws_ami" "al2023" {
   most_recent = true
-  owners      = ["792107900819"]
+  owners      = ["137112412989"]
   filter {
     name   = "name"
-    values = ["Rocky-8-EC2-Base-8.*-x86_64-*"]
+    values = ["al2023-ami-2023.*-x86_64"]
   }
   filter {
     name   = "virtualization-type"
@@ -169,6 +175,26 @@ resource "aws_iam_role_policy" "secrets_read" {
   })
 }
 
+resource "aws_iam_role_policy" "cloudwatch" {
+  name = "hubzero-cloudwatch"
+  role = aws_iam_role.hubzero.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "cloudwatch:PutMetricData",
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams",
+        "logs:DescribeLogGroups"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "hubzero" {
   name_prefix = "hubzero-${var.environment}-"
   role        = aws_iam_role.hubzero.name
@@ -229,7 +255,7 @@ resource "aws_db_instance" "hubzero" {
 
 # --- EC2 ---
 resource "aws_instance" "hubzero" {
-  ami                         = data.aws_ami.rocky8.id
+  ami                         = data.aws_ami.al2023.id
   instance_type               = local.config.instance_type
   subnet_id                   = data.aws_subnet.selected.id
   vpc_security_group_ids      = [aws_security_group.hubzero.id]
@@ -259,6 +285,9 @@ resource "aws_instance" "hubzero" {
     "export HUBZERO_DB_USER='hubzero'",
     "export HUBZERO_DB_SECRET_ARN='${var.use_rds ? aws_db_instance.hubzero[0].master_user_secret[0].secret_arn : ""}'",
     "export HUBZERO_CERTBOT_EMAIL='${var.certbot_email}'",
+    "export HUBZERO_ENABLE_MONITORING='${tostring(var.enable_monitoring)}'",
+    "export HUBZERO_CW_LOG_GROUP_PREFIX='/aws/ec2/hubzero-${var.environment}'",
+    "export HUBZERO_S3_BUCKET='${var.enable_s3_storage ? aws_s3_bucket.hubzero[0].id : ""}'",
     file("${path.module}/../scripts/userdata.sh"),
   ]))
 
@@ -272,6 +301,10 @@ resource "aws_instance" "hubzero" {
     precondition {
       condition     = can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/3[0-2]$", var.allowed_cidr)) || var.environment == "test"
       error_message = "For staging/prod, allowed_cidr must be a /30 or narrower CIDR (e.g. x.x.x.x/32)."
+    }
+    precondition {
+      condition     = var.use_rds || var.environment == "test"
+      error_message = "use_rds=false is not recommended for staging/prod. Set use_rds=true or acknowledge with environment=test."
     }
   }
 }
@@ -329,4 +362,215 @@ resource "aws_dlm_lifecycle_policy" "hubzero" {
       Name = "hubzero-${var.environment}"
     }
   }
+}
+
+# --- CloudWatch Monitoring (conditional) ---
+resource "aws_cloudwatch_log_group" "userdata" {
+  count             = var.enable_monitoring ? 1 : 0
+  name              = "/aws/ec2/hubzero-${var.environment}/userdata"
+  retention_in_days = local.mon.log_retention
+}
+
+resource "aws_cloudwatch_log_group" "apache_access" {
+  count             = var.enable_monitoring ? 1 : 0
+  name              = "/aws/ec2/hubzero-${var.environment}/apache-access"
+  retention_in_days = local.mon.log_retention
+}
+
+resource "aws_cloudwatch_log_group" "apache_error" {
+  count             = var.enable_monitoring ? 1 : 0
+  name              = "/aws/ec2/hubzero-${var.environment}/apache-error"
+  retention_in_days = local.mon.log_retention
+}
+
+resource "aws_sns_topic" "hubzero" {
+  count = var.enable_monitoring ? 1 : 0
+  name  = "hubzero-${var.environment}-alarms"
+}
+
+resource "aws_sns_topic_subscription" "email" {
+  count     = var.enable_monitoring && var.alarm_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.hubzero[0].arn
+  protocol  = "email"
+  endpoint  = var.alarm_email
+}
+
+resource "aws_cloudwatch_metric_alarm" "ec2_cpu" {
+  count               = var.enable_monitoring ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-ec2-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = local.mon.eval_periods
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = local.mon.alarm_period
+  statistic           = "Average"
+  threshold           = local.mon.cpu_threshold
+  alarm_description   = "EC2 CPU utilization above ${local.mon.cpu_threshold}%"
+  dimensions          = { InstanceId = aws_instance.hubzero.id }
+  alarm_actions       = [aws_sns_topic.hubzero[0].arn]
+  ok_actions          = [aws_sns_topic.hubzero[0].arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "ec2_status" {
+  count               = var.enable_monitoring ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-ec2-status"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "EC2 status check failed"
+  dimensions          = { InstanceId = aws_instance.hubzero.id }
+  alarm_actions       = [aws_sns_topic.hubzero[0].arn]
+  ok_actions          = [aws_sns_topic.hubzero[0].arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "ec2_memory" {
+  count               = var.enable_monitoring ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-ec2-memory"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = local.mon.eval_periods
+  metric_name         = "mem_used_percent"
+  namespace           = "CWAgent"
+  period              = local.mon.alarm_period
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "EC2 memory usage above 80%"
+  dimensions          = { InstanceId = aws_instance.hubzero.id }
+  alarm_actions       = [aws_sns_topic.hubzero[0].arn]
+  ok_actions          = [aws_sns_topic.hubzero[0].arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "ec2_disk" {
+  count               = var.enable_monitoring ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-ec2-disk"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = local.mon.eval_periods
+  metric_name         = "disk_used_percent"
+  namespace           = "CWAgent"
+  period              = local.mon.alarm_period
+  statistic           = "Average"
+  threshold           = 85
+  alarm_description   = "EC2 disk usage above 85%"
+  dimensions = {
+    InstanceId = aws_instance.hubzero.id
+    path       = "/"
+  }
+  alarm_actions = [aws_sns_topic.hubzero[0].arn]
+  ok_actions    = [aws_sns_topic.hubzero[0].arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_cpu" {
+  count               = var.enable_monitoring && var.use_rds ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-rds-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = local.mon.eval_periods
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = local.mon.alarm_period
+  statistic           = "Average"
+  threshold           = local.mon.cpu_threshold
+  alarm_description   = "RDS CPU utilization above ${local.mon.cpu_threshold}%"
+  dimensions          = { DBInstanceIdentifier = aws_db_instance.hubzero[0].identifier }
+  alarm_actions       = [aws_sns_topic.hubzero[0].arn]
+  ok_actions          = [aws_sns_topic.hubzero[0].arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_connections" {
+  count               = var.enable_monitoring && var.use_rds ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-rds-connections"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = local.mon.eval_periods
+  metric_name         = "DatabaseConnections"
+  namespace           = "AWS/RDS"
+  period              = local.mon.alarm_period
+  statistic           = "Average"
+  threshold           = 100
+  alarm_description   = "RDS connection count above 100"
+  dimensions          = { DBInstanceIdentifier = aws_db_instance.hubzero[0].identifier }
+  alarm_actions       = [aws_sns_topic.hubzero[0].arn]
+  ok_actions          = [aws_sns_topic.hubzero[0].arn]
+}
+
+# --- S3 File Storage (optional) ---
+resource "aws_s3_bucket" "hubzero" {
+  count         = var.enable_s3_storage ? 1 : 0
+  bucket_prefix = "hubzero-${var.environment}-"
+}
+
+resource "aws_s3_bucket_versioning" "hubzero" {
+  count  = var.enable_s3_storage ? 1 : 0
+  bucket = aws_s3_bucket.hubzero[0].id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "hubzero" {
+  count  = var.enable_s3_storage ? 1 : 0
+  bucket = aws_s3_bucket.hubzero[0].id
+  rule {
+    apply_server_side_encryption_by_default { sse_algorithm = "aws:kms" }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "hubzero" {
+  count                   = var.enable_s3_storage ? 1 : 0
+  bucket                  = aws_s3_bucket.hubzero[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "hubzero" {
+  count  = var.enable_s3_storage ? 1 : 0
+  bucket = aws_s3_bucket.hubzero[0].id
+  rule {
+    id     = "transition-to-ia"
+    status = "Enabled"
+    filter {}
+    transition {
+      days          = 90
+      storage_class = "STANDARD_IA"
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "s3" {
+  count = var.enable_s3_storage ? 1 : 0
+  name  = "hubzero-s3"
+  role  = aws_iam_role.hubzero.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ]
+      Resource = [
+        aws_s3_bucket.hubzero[0].arn,
+        "${aws_s3_bucket.hubzero[0].arn}/*"
+      ]
+    }]
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_storage" {
+  count               = var.enable_monitoring && var.use_rds ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-rds-storage"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = local.mon.eval_periods
+  metric_name         = "FreeStorageSpace"
+  namespace           = "AWS/RDS"
+  period              = local.mon.alarm_period
+  statistic           = "Average"
+  threshold           = 5368709120
+  alarm_description   = "RDS free storage below 5 GB"
+  dimensions          = { DBInstanceIdentifier = aws_db_instance.hubzero[0].identifier }
+  alarm_actions       = [aws_sns_topic.hubzero[0].arn]
+  ok_actions          = [aws_sns_topic.hubzero[0].arn]
 }

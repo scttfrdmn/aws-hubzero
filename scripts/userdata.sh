@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HubZero Platform bootstrap for Rocky Linux 8 on EC2
+# HubZero Platform bootstrap for Amazon Linux 2023 on EC2
 # Installs: Apache 2.4, PHP 8.2, (optionally) MariaDB 10.11, HubZero CMS v2.4
 set -euo pipefail
 
@@ -23,6 +23,9 @@ HUBZERO_DB_USER="${HUBZERO_DB_USER:-hubzero}"
 HUBZERO_USE_RDS="${HUBZERO_USE_RDS:-false}"
 HUBZERO_INSTALL_PLATFORM="${HUBZERO_INSTALL_PLATFORM:-false}"
 HUBZERO_CERTBOT_EMAIL="${HUBZERO_CERTBOT_EMAIL:-}"
+HUBZERO_ENABLE_MONITORING="${HUBZERO_ENABLE_MONITORING:-false}"
+HUBZERO_CW_LOG_GROUP_PREFIX="${HUBZERO_CW_LOG_GROUP_PREFIX:-/aws/ec2/hubzero}"
+HUBZERO_S3_BUCKET="${HUBZERO_S3_BUCKET:-}"
 
 # Retrieve DB password: from Secrets Manager if ARN provided, else generate locally
 HUBZERO_DB_SECRET_ARN="${HUBZERO_DB_SECRET_ARN:-}"
@@ -49,7 +52,7 @@ echo "Install full platform: ${HUBZERO_INSTALL_PLATFORM}"
 # 1. System updates & base packages
 ###############################################################################
 dnf -y update
-dnf -y install epel-release
+# AL2023: fail2ban is in the standard repos; no EPEL needed
 dnf -y install vim wget curl unzip git tar policycoreutils-python-utils \
   cronie logrotate jq fail2ban
 
@@ -146,10 +149,15 @@ fi
 ###############################################################################
 if [ "${HUBZERO_USE_RDS}" = "true" ]; then
     echo "=== Skipping local MariaDB install (using RDS at ${HUBZERO_DB_HOST}) ==="
-    dnf -y install mariadb
+    # AL2023: use MariaDB community client package
+    curl -sS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
+      | bash -s -- --mariadb-server-version=mariadb-10.11
+    dnf install -y MariaDB-client
 else
-    dnf -y module reset mariadb
-    dnf -y module install mariadb:10.11/server
+    # AL2023: MariaDB community repo (capital M packages)
+    curl -sS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
+      | bash -s -- --mariadb-server-version=mariadb-10.11
+    dnf install -y MariaDB-server MariaDB-client
     systemctl enable --now mariadb
 
     # Credential operations not logged
@@ -165,10 +173,10 @@ fi
 ###############################################################################
 # 4. PHP 8.2
 ###############################################################################
-dnf -y module reset php
-dnf -y module install php:8.2
-dnf -y install php php-cli php-common php-mysqlnd php-xml php-mbstring \
-  php-json php-gd php-curl php-zip php-intl php-ldap php-opcache php-soap
+# AL2023: versioned PHP packages (no dnf module streams needed)
+dnf -y install php8.2 php8.2-cli php8.2-common php8.2-mysqlnd php8.2-xml \
+  php8.2-mbstring php8.2-gd php8.2-curl php8.2-zip php8.2-intl \
+  php8.2-ldap php8.2-opcache php8.2-soap php8.2-json php8.2-fpm
 
 cat > /etc/php.d/99-hubzero.ini <<'PHPINI'
 upload_max_filesize = 128M
@@ -263,10 +271,14 @@ fi
     echo "HUBZERO_DB_NAME=${HUBZERO_DB_NAME}"
     echo "HUBZERO_DB_USER=${HUBZERO_DB_USER}"
     echo "HUBZERO_DB_SECRET_ARN=${HUBZERO_DB_SECRET_ARN}"
+    echo "HUBZERO_S3_BUCKET=${HUBZERO_S3_BUCKET}"
     if [ "${HUBZERO_USE_RDS}" != "true" ]; then
         echo "HUBZERO_DB_PASS=${HUBZERO_DB_PASS}"
     fi
 } > /root/.hubzero-credentials 2>/dev/null
+# NOTE: HubZero S3 filesystem adapter config is required to use the S3 bucket.
+# Set HUBZERO_S3_BUCKET above and configure the HubZero filesystem plugin
+# to point to this bucket (out of scope for bootstrap script).
 chmod 600 /root/.hubzero-credentials
 
 ###############################################################################
@@ -276,6 +288,73 @@ if systemctl is-active --quiet firewalld; then
     firewall-cmd --permanent --add-service=http
     firewall-cmd --permanent --add-service=https
     firewall-cmd --reload
+fi
+
+###############################################################################
+# 9. CloudWatch Agent (optional)
+###############################################################################
+if [ "${HUBZERO_ENABLE_MONITORING}" = "true" ]; then
+    echo "=== Installing CloudWatch Agent ==="
+    # AL2023: amazon-cloudwatch-agent is in the standard repos
+    dnf install -y amazon-cloudwatch-agent
+
+    CW_LG_USERDATA="${HUBZERO_CW_LOG_GROUP_PREFIX}/userdata"
+    CW_LG_APACHE_ACCESS="${HUBZERO_CW_LOG_GROUP_PREFIX}/apache-access"
+    CW_LG_APACHE_ERROR="${HUBZERO_CW_LOG_GROUP_PREFIX}/apache-error"
+
+    cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCONF
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "metrics": {
+    "namespace": "CWAgent",
+    "append_dimensions": {
+      "InstanceId": "\${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "mem": {
+        "measurement": ["mem_used_percent"]
+      },
+      "disk": {
+        "measurement": ["disk_used_percent"],
+        "resources": ["/"]
+      }
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/hubzero-userdata.log",
+            "log_group_name": "${CW_LG_USERDATA}",
+            "log_stream_name": "\${aws:InstanceId}",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/httpd/hubzero-access.log",
+            "log_group_name": "${CW_LG_APACHE_ACCESS}",
+            "log_stream_name": "\${aws:InstanceId}",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/httpd/hubzero-error.log",
+            "log_group_name": "${CW_LG_APACHE_ERROR}",
+            "log_stream_name": "\${aws:InstanceId}",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  }
+}
+CWCONF
+
+    amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 \
+      -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+    echo "=== CloudWatch Agent started ==="
 fi
 
 echo "=== HubZero bootstrap completed at $(date) ==="

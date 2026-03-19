@@ -33,3 +33,13 @@ output "ssm_connect_command" {
   description = "Command to connect via SSM Session Manager"
   value       = "aws ssm start-session --target ${aws_instance.hubzero.id}"
 }
+
+output "sns_topic_arn" {
+  description = "SNS topic ARN for CloudWatch alarms (empty if monitoring disabled)"
+  value       = var.enable_monitoring ? aws_sns_topic.hubzero[0].arn : ""
+}
+
+output "s3_bucket_name" {
+  description = "S3 bucket name for HubZero file storage (empty if disabled)"
+  value       = var.enable_s3_storage ? aws_s3_bucket.hubzero[0].id : ""
+}

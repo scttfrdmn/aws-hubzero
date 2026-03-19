@@ -5,5 +5,8 @@
   "domainName": "",
   "certbotEmail": "",
   "installPlatform": "false",
-  "useRds": "false"
+  "useRds": "true",
+  "enableS3Storage": "true",
+  "enableMonitoring": "true",
+  "alarmEmail": ""
 }

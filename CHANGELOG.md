@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-18
+
+### Added
+- **Issue #9**: Migrated from Rocky Linux 8 to Amazon Linux 2023 (AL2023)
+  - Replaced Rocky 8 AMI data source with AL2023 (`owners = ["137112412989"]`, name filter `al2023-ami-2023.*-x86_64`)
+  - CDK: replaced `MachineImage.lookup` with `MachineImage.latestAmazonLinux2023`
+  - `scripts/userdata.sh`: removed EPEL install; switched to MariaDB community repo (`mariadb_repo_setup`) with capital-M packages (`MariaDB-server`, `MariaDB-client`); switched to versioned PHP packages (`php8.2`, `php8.2-fpm`, etc.); replaced S3 RPM CloudWatch Agent install with `dnf install -y amazon-cloudwatch-agent`
+- **Issue #10**: S3-backed file storage via `enable_s3_storage` variable (default: `true`)
+  - Terraform: `aws_s3_bucket` with versioning, KMS SSE, public access block, 90-day STANDARD_IA lifecycle; `aws_iam_role_policy` granting `s3:GetObject/PutObject/DeleteObject/ListBucket` to EC2 role
+  - CDK: `s3.Bucket` construct with equivalent properties; `grantReadWrite` to instance role
+  - `userdata.sh`: exports `HUBZERO_S3_BUCKET`; note in credentials file for filesystem adapter config
+  - Terraform: `s3_bucket_name` output
+- **Issue #11**: RDS is now the recommended default
+  - `use_rds` default changed from `false` to `true`
+  - `aws_instance` lifecycle precondition: `use_rds=false` raises an error for staging/prod (use `environment=test` to bypass)
+  - `staging.tfvars` and `prod.tfvars`: added `use_rds = true` with commented example `rds_subnet_ids`
+  - CDK `cdk.context.example.json`: `useRds` default changed to `"true"`; added `enableS3Storage: "true"`
+  - README: architecture section updated to reflect AL2023 and RDS-as-default
+
+## [0.2.0] - 2026-03-18
+
+### Added
+- CloudWatch monitoring and alerting gated by `enable_monitoring` flag (default: true)
+- **Terraform**: `enable_monitoring` and `alarm_email` variables; `monitoring_config`
+  locals with per-environment log retention, CPU thresholds, alarm periods, and
+  evaluation periods
+- **Terraform**: IAM policy `cloudwatch` granting `PutMetricData` and log management
+  actions to the EC2 instance role (unconditional, required for CWAgent to start)
+- **Terraform**: Three CloudWatch log groups per environment (`/userdata`,
+  `/apache-access`, `/apache-error`) with environment-specific retention
+- **Terraform**: SNS topic `hubzero-{env}-alarms` with optional email subscription
+- **Terraform**: Four EC2 CloudWatch alarms: CPU, StatusCheckFailed, mem_used_percent,
+  disk_used_percent; three RDS alarms (CPU, DatabaseConnections, FreeStorageSpace),
+  all conditional on `enable_monitoring` (RDS alarms also require `use_rds=true`)
+- **Terraform**: `sns_topic_arn` output
+- **CDK**: Equivalent monitoring block with `MONITORING_CONFIG` constant,
+  `enableMonitoring`/`alarmEmail` context reads, log groups, SNS topic, all 7 alarms,
+  and `SnsTopicArn` CfnOutput
+- **`scripts/userdata.sh`**: Section 9 — CloudWatch Agent install via S3 RPM,
+  JSON config (mem + disk metrics, 3 log file tails), agent start; wrapped in
+  `HUBZERO_ENABLE_MONITORING` guard
+- `cdk/cdk.context.example.json`: `enableMonitoring` and `alarmEmail` keys
+
 ## [0.1.0] - 2026-03-18
 
 ### Added
@@ -28,5 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PHP hardening, Docker user namespace remapping, Composer integrity checks,
   encrypted EBS and RDS at rest, Secrets Manager for RDS credentials
 
-[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/aws-hubzero/releases/tag/v0.1.0

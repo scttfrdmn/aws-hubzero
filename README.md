@@ -4,7 +4,9 @@ Deploy the [HubZero](https://help.hubzero.org/) platform on AWS using either Ter
 
 ## Architecture
 
-**Current**: Single EC2 instance (Rocky Linux 8) running Apache 2.4, PHP 8.2, MariaDB 10.11 (local or RDS), and HubZero CMS v2.4. Optional Docker-based Solr search.
+**Current**: Single EC2 instance (Amazon Linux 2023) running Apache 2.4, PHP 8.2, RDS MariaDB 10.11 (recommended default), and HubZero CMS v2.4. Optional Docker-based Solr search. Optional S3 bucket for durable file storage.
+
+RDS is the recommended database backend for staging and production — `use_rds=true` is the default. Local MariaDB is available for test environments only.
 
 Planned architecture improvements are tracked in [GitHub Issues](https://github.com/scttfrdmn/aws-hubzero/milestone/3).
 
@@ -180,8 +182,9 @@ Once the log shows `HubZero bootstrap completed`, the web interface is available
 | `domain_name` / `domainName` | Domain for HTTPS (optional) | `""` |
 | `certbot_email` / `certbotEmail` | Email for TLS cert expiry alerts | `""` |
 | `install_platform` / `installPlatform` | Install full platform (Docker + Solr) | `false` |
-| `use_rds` / `useRds` | Use RDS MariaDB instead of local | `false` |
+| `use_rds` / `useRds` | Use RDS MariaDB instead of local | `true` |
 | `rds_subnet_ids` | Subnet IDs for RDS (Terraform, ≥2 AZs) | `[]` |
+| `enable_s3_storage` / `enableS3Storage` | Provision S3 bucket for file storage | `true` |
 
 ### RDS Option
 

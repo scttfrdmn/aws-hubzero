@@ -55,7 +55,13 @@ variable "install_platform" {
 
 variable "use_rds" {
   type    = bool
-  default = false
+  default = true
+}
+
+variable "enable_s3_storage" {
+  type        = bool
+  default     = true
+  description = "Provision an S3 bucket for HubZero file storage with versioning and lifecycle management"
 }
 
 variable "rds_subnet_ids" {
@@ -66,4 +72,16 @@ variable "rds_subnet_ids" {
     condition     = length(var.rds_subnet_ids) == 0 || length(var.rds_subnet_ids) >= 2
     error_message = "rds_subnet_ids must contain at least 2 subnets in different AZs when provided."
   }
+}
+
+variable "enable_monitoring" {
+  type        = bool
+  default     = true
+  description = "Enable CloudWatch monitoring, log shipping, and alarms"
+}
+
+variable "alarm_email" {
+  type        = string
+  default     = ""
+  description = "Email for CloudWatch alarm SNS notifications (empty = topic created, no subscription)"
 }
