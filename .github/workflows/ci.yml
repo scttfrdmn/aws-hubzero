@@ -50,3 +50,19 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+  packer:
+    name: Packer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Init Packer plugins
+        run: packer init packer/hubzero.pkr.hcl
+
+      - name: Validate Packer template
+        run: packer validate packer/hubzero.pkr.hcl

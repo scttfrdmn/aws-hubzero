@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# HubZero Platform bootstrap for Amazon Linux 2023 on EC2
-# Installs: Apache 2.4, PHP 8.2, (optionally) MariaDB 10.11, HubZero CMS v2.4
+# HubZero Platform launch-time bootstrap for Amazon Linux 2023 on EC2
+# Handles env-specific configuration only; static software installs are
+# pre-baked into the AMI via scripts/bake.sh (Packer).
+# When using the base AL2023 AMI (use_baked_ami=false), bake.sh is prepended
+# to this script by the Terraform/CDK launcher.
 set -euo pipefail
 
-# Separate log for sensitive operations (not logged)
 exec > >(tee /var/log/hubzero-userdata.log) 2>&1
 chmod 600 /var/log/hubzero-userdata.log
 
@@ -16,6 +18,41 @@ imds_get() {
 }
 AWS_REGION=$(imds_get placement/region)
 
+###############################################################################
+# 0. Optional: source configuration from SSM Parameter Store
+###############################################################################
+HUBZERO_ENABLE_PARAMETER_STORE="${HUBZERO_ENABLE_PARAMETER_STORE:-false}"
+HUBZERO_ENVIRONMENT="${HUBZERO_ENVIRONMENT:-}"
+
+if [ "${HUBZERO_ENABLE_PARAMETER_STORE}" = "true" ] && [ -n "${HUBZERO_ENVIRONMENT}" ]; then
+    echo "=== Sourcing configuration from SSM Parameter Store ==="
+    SSM_PATH="/hubzero/${HUBZERO_ENVIRONMENT}"
+    if aws ssm get-parameters-by-path \
+          --region "${AWS_REGION}" \
+          --path "${SSM_PATH}" \
+          --with-decryption \
+          --query 'Parameters[*].[Name,Value]' \
+          --output text 2>/dev/null | \
+        while IFS=$'\t' read -r name value; do
+            key="${name##*/}"
+            # Map SSM parameter names to env vars
+            case "${key}" in
+                domain_name)      export HUBZERO_DOMAIN="${value}" ;;
+                db_host)          export HUBZERO_DB_HOST="${value}" ;;
+                db_name)          export HUBZERO_DB_NAME="${value}" ;;
+                db_user)          export HUBZERO_DB_USER="${value}" ;;
+                s3_bucket)        export HUBZERO_S3_BUCKET="${value}" ;;
+                enable_monitoring) export HUBZERO_ENABLE_MONITORING="${value}" ;;
+                cw_log_prefix)    export HUBZERO_CW_LOG_GROUP_PREFIX="${value}" ;;
+            esac
+        done; then
+        echo "=== SSM Parameter Store sourced successfully ==="
+    else
+        echo "WARNING: SSM Parameter Store sourcing failed — using env var fallbacks"
+    fi
+fi
+
+# Environment variable defaults (override with Terraform/CDK exports or SSM values above)
 HUBZERO_DOMAIN="${HUBZERO_DOMAIN:-$(imds_get public-ipv4)}"
 HUBZERO_DB_HOST="${HUBZERO_DB_HOST:-localhost}"
 HUBZERO_DB_NAME="${HUBZERO_DB_NAME:-hubzero}"
@@ -31,7 +68,6 @@ HUBZERO_ENABLE_ALB="${HUBZERO_ENABLE_ALB:-false}"
 # Retrieve DB password: from Secrets Manager if ARN provided, else generate locally
 HUBZERO_DB_SECRET_ARN="${HUBZERO_DB_SECRET_ARN:-}"
 {
-    # Credential retrieval in a subshell — output not sent to main log
     if [ -n "${HUBZERO_DB_SECRET_ARN}" ]; then
         HUBZERO_DB_PASS=$(aws secretsmanager get-secret-value \
           --region "${AWS_REGION}" \
@@ -50,67 +86,12 @@ echo "Use RDS: ${HUBZERO_USE_RDS}"
 echo "Install full platform: ${HUBZERO_INSTALL_PLATFORM}"
 
 ###############################################################################
-# 1. System updates & base packages
+# 1. Start baked services (fail2ban, httpd, php-fpm are already installed/enabled
+#    by bake.sh; just start them here with current config)
 ###############################################################################
-dnf -y update
-# AL2023: fail2ban is in the standard repos; no EPEL needed
-dnf -y install vim wget curl unzip git tar policycoreutils-python-utils \
-  cronie logrotate jq fail2ban
-
-###############################################################################
-# 1a. fail2ban (apache jails only — SSH port is not exposed)
-###############################################################################
-cat > /etc/fail2ban/jail.local <<'F2BCONF'
-[DEFAULT]
-bantime  = 3600
-findtime = 600
-maxretry = 5
-
-[apache-auth]
-enabled  = true
-port     = http,https
-logpath  = /var/log/httpd/*error*log
-
-[apache-badbots]
-enabled  = true
-port     = http,https
-logpath  = /var/log/httpd/*access*log
-F2BCONF
-systemctl enable --now fail2ban
-
-###############################################################################
-# 2. Apache 2.4
-###############################################################################
-dnf -y install httpd mod_ssl mod_headers
-systemctl enable --now httpd
-
-# Shared security headers (loaded by both HTTP and HTTPS vhosts)
-# NOTE: CSP uses unsafe-inline/unsafe-eval for script-src because HubZero's
-# legacy JS requires it. Track https://github.com/hubzero/hubzero-cms/issues
-# for future nonce-based CSP migration.
-cat > /etc/httpd/conf.d/security-headers.conf <<'HEADERSCONF'
-ServerTokens Prod
-ServerSignature Off
-Header always set X-Content-Type-Options "nosniff"
-Header always set X-Frame-Options "SAMEORIGIN"
-Header always set Referrer-Policy "strict-origin-when-cross-origin"
-Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'self'"
-Header always set Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
-Header always set X-Permitted-Cross-Domain-Policies "none"
-HEADERSCONF
-
-cat > /etc/httpd/conf.d/hubzero.conf <<'APACHECONF'
-<VirtualHost *:80>
-    DocumentRoot /var/www/hubzero/public
-    <Directory /var/www/hubzero/public>
-        Options -Indexes +SymLinksIfOwnerMatch
-        AllowOverride All
-        Require all granted
-    </Directory>
-    ErrorLog  /var/log/httpd/hubzero-error.log
-    CustomLog /var/log/httpd/hubzero-access.log combined
-</VirtualHost>
-APACHECONF
+systemctl start fail2ban || true
+systemctl start php-fpm  || true
+systemctl start httpd    || true
 
 ###############################################################################
 # 2a. TLS via certbot (if domain is set, not an IP, and ALB is not handling TLS)
@@ -129,7 +110,6 @@ if [[ "${HUBZERO_ENABLE_ALB}" != "true" && -n "${HUBZERO_DOMAIN}" && ! "${HUBZER
       -d "${HUBZERO_DOMAIN}" || \
       echo "WARNING: certbot failed — TLS not configured. Set up manually."
 
-    # Add HSTS to the SSL vhost created by certbot and verify
     if [ -f /etc/httpd/conf.d/hubzero-le-ssl.conf ]; then
         if ! grep -q "Strict-Transport-Security" /etc/httpd/conf.d/hubzero-le-ssl.conf; then
             sed -i '/<\/VirtualHost>/i \    Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains"' \
@@ -140,7 +120,6 @@ if [[ "${HUBZERO_ENABLE_ALB}" != "true" && -n "${HUBZERO_DOMAIN}" && ! "${HUBZER
         fi
     fi
 
-    # Auto-renew via cron — log errors, reload Apache on success
     echo "0 3 * * * root certbot renew --deploy-hook 'systemctl reload httpd' 2>&1 | logger -t certbot-renew" > /etc/cron.d/certbot-renew
     chmod 644 /etc/cron.d/certbot-renew
 fi
@@ -150,18 +129,14 @@ fi
 ###############################################################################
 if [ "${HUBZERO_USE_RDS}" = "true" ]; then
     echo "=== Skipping local MariaDB install (using RDS at ${HUBZERO_DB_HOST}) ==="
-    # AL2023: use MariaDB community client package
-    curl -sS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
-      | bash -s -- --mariadb-server-version=mariadb-10.11
-    dnf install -y MariaDB-client
 else
-    # AL2023: MariaDB community repo (capital M packages)
-    curl -sS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
-      | bash -s -- --mariadb-server-version=mariadb-10.11
-    dnf install -y MariaDB-server MariaDB-client
-    systemctl enable --now mariadb
+    # AL2023: MariaDB community repo (bake.sh installs client; add server here)
+    if ! systemctl is-active --quiet mariadb; then
+        # MariaDB repo already configured by bake.sh
+        dnf install -y MariaDB-server
+        systemctl enable --now mariadb
+    fi
 
-    # Credential operations not logged
     {
         mysql -e "CREATE DATABASE IF NOT EXISTS \`${HUBZERO_DB_NAME}\`;"
         mysql -e "CREATE USER IF NOT EXISTS '${HUBZERO_DB_USER}'@'localhost' IDENTIFIED BY '${HUBZERO_DB_PASS}';"
@@ -172,75 +147,12 @@ else
 fi
 
 ###############################################################################
-# 4. PHP 8.2
-###############################################################################
-# AL2023: versioned PHP packages (no dnf module streams needed)
-dnf -y install php8.2 php8.2-cli php8.2-common php8.2-mysqlnd php8.2-xml \
-  php8.2-mbstring php8.2-gd php8.2-curl php8.2-zip php8.2-intl \
-  php8.2-ldap php8.2-opcache php8.2-soap php8.2-json php8.2-fpm
-
-cat > /etc/php.d/99-hubzero.ini <<'PHPINI'
-upload_max_filesize = 128M
-post_max_size = 128M
-memory_limit = 256M
-max_execution_time = 120
-date.timezone = UTC
-expose_php = Off
-session.cookie_httponly = On
-session.cookie_secure = On
-session.cookie_samesite = Lax
-PHPINI
-
-systemctl enable --now php-fpm
-systemctl restart httpd
-
-###############################################################################
-# 5. HubZero CMS v2.4 (Composer-based install)
-###############################################################################
-# Install Composer with hash verification
-EXPECTED_CHECKSUM="$(php -r 'copy("https://composer.github.io/installer.sig", "php://stdout");')"
-php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
-ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
-if [ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]; then
-    echo "ERROR: Composer installer checksum mismatch" >&2
-    rm composer-setup.php
-    exit 1
-fi
-php composer-setup.php --install-dir=/usr/local/bin --filename=composer
-rm composer-setup.php
-
-mkdir -p /var/www/hubzero
-chown apache:apache /var/www/hubzero
-cd /var/www/hubzero
-
-# Clone pinned release at a specific commit and install as the apache user
-HUBZERO_COMMIT="${HUBZERO_COMMIT:-}"
-if [ ! -f composer.json ]; then
-    sudo -u apache git clone --branch 2.4 \
-      https://github.com/hubzero/hubzero-cms.git .
-    if [ -n "${HUBZERO_COMMIT}" ]; then
-        sudo -u apache git checkout "${HUBZERO_COMMIT}"
-    fi
-    sudo -u apache composer install --no-dev --no-scripts --optimize-autoloader
-fi
-
-chown -R apache:apache /var/www/hubzero
-chmod -R 755 /var/www/hubzero
-
-# Restrict config files to owner-only read (defense-in-depth)
-if [ -d /var/www/hubzero/app/config ]; then
-    chmod 750 /var/www/hubzero/app/config
-    chmod 640 /var/www/hubzero/app/config/*.php 2>/dev/null || true
-fi
-
-###############################################################################
 # 6. Full Platform components (optional)
 ###############################################################################
 SOLR_IMAGE="solr:9.7@sha256:a09daa1b5960b5cb2b590218baf733b6c7a95b29be29ae066421079c5ea9b987"
 if [ "${HUBZERO_INSTALL_PLATFORM}" = "true" ]; then
     echo "=== Installing full HubZero Platform components ==="
 
-    # Docker with user namespace remapping
     dnf -y install dnf-plugins-core
     dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
     dnf -y install docker-ce docker-ce-cli containerd.io
@@ -253,7 +165,6 @@ if [ "${HUBZERO_INSTALL_PLATFORM}" = "true" ]; then
 DOCKERCONF
     systemctl enable --now docker
 
-    # Solr bound to localhost only, with resource limits and read-only filesystem
     docker pull "${SOLR_IMAGE}"
     docker run -d --name hubzero-solr --restart unless-stopped \
         --memory=1g --cpus=1.0 \
@@ -264,7 +175,7 @@ DOCKERCONF
 fi
 
 ###############################################################################
-# 7. Store credential reference (includes local DB password when not using RDS)
+# 7. Store credential reference
 ###############################################################################
 {
     umask 077
@@ -278,26 +189,23 @@ fi
     fi
 } > /root/.hubzero-credentials 2>/dev/null
 # NOTE: HubZero S3 filesystem adapter config is required to use the S3 bucket.
-# Set HUBZERO_S3_BUCKET above and configure the HubZero filesystem plugin
-# to point to this bucket (out of scope for bootstrap script).
+# Configure the HubZero filesystem plugin to point to HUBZERO_S3_BUCKET.
 chmod 600 /root/.hubzero-credentials
 
 ###############################################################################
 # 8. Firewall
 ###############################################################################
-if systemctl is-active --quiet firewalld; then
+if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
     firewall-cmd --permanent --add-service=http
     firewall-cmd --permanent --add-service=https
     firewall-cmd --reload
 fi
 
 ###############################################################################
-# 9. CloudWatch Agent (optional)
+# 9. CloudWatch Agent (optional; binary already installed by bake.sh)
 ###############################################################################
 if [ "${HUBZERO_ENABLE_MONITORING}" = "true" ]; then
-    echo "=== Installing CloudWatch Agent ==="
-    # AL2023: amazon-cloudwatch-agent is in the standard repos
-    dnf install -y amazon-cloudwatch-agent
+    echo "=== Configuring CloudWatch Agent ==="
 
     CW_LG_USERDATA="${HUBZERO_CW_LOG_GROUP_PREFIX}/userdata"
     CW_LG_APACHE_ACCESS="${HUBZERO_CW_LOG_GROUP_PREFIX}/apache-access"

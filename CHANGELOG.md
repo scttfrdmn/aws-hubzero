@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-18
+
+### Added
+- **Issue #15**: Packer AMI baking (`packer/hubzero.pkr.hcl`, `scripts/bake.sh`)
+  - `packer/hubzero.pkr.hcl`: AL2023 base, `t3.medium` bake instance, shell provisioner runs `bake.sh`, AMI named `hubzero-base-<date>`, tagged with `Project=hubzero` and `GitSHA`
+  - `scripts/bake.sh`: extracted static installs from `userdata.sh` — base packages, fail2ban config, Apache + security headers + vhost config, MariaDB client, PHP 8.2 packages + config, Composer + HubZero CMS clone
+  - `scripts/userdata.sh`: refactored to env-specific only — services start, certbot, local MariaDB server (if !RDS), Docker+Solr, credentials file, firewall, CWAgent config+start
+  - Terraform: `use_baked_ami` variable (default `true`); `data.aws_ami.hubzero_baked` data source (owner=self, filter=`hubzero-base-*`); EC2 uses baked AMI when available, falls back to AL2023; `bake.sh` prepended to userdata when `use_baked_ami=false`
+  - CDK: `useBakedAmi` context variable; `MachineImage.lookup` for baked AMI; falls back to `latestAmazonLinux2023`
+  - CI: `packer` job validates `packer/hubzero.pkr.hcl` on every PR/push; actual `packer build` gated by secrets
+- **Issue #16**: SSM Patch Manager via `enable_patch_manager` variable (default: `true`)
+  - `aws_ssm_patch_baseline`: AL2023, Security/Critical+Important classification, 7-day approval
+  - `aws_ssm_patch_group`, `aws_ssm_maintenance_window` (Sunday 03:00 UTC), maintenance window target + task (`AWS-RunPatchBaseline`)
+  - EC2 instance tagged with `Patch Group = hubzero-${environment}` for SSM targeting
+  - CloudWatch alarm: `SSM/NonCompliantCount > 0` for the patch group
+  - CDK: `CfnPatchBaseline`, `CfnAssociation` with schedule; `Patch Group` tag on instance
+- **Issue #17**: SSM Parameter Store via `enable_parameter_store` variable (default: `true`)
+  - Parameters: `domain_name`, `db_host`, `db_name`, `db_user`, `s3_bucket`, `enable_monitoring`, `cw_log_prefix` under `/hubzero/${environment}/`
+  - IAM policy: `ssm:GetParametersByPath` + `ssm:GetParameter` on the environment path
+  - `scripts/userdata.sh`: at startup, sources SSM parameters via `get-parameters-by-path` and maps to env vars; env var fallbacks remain for compatibility
+  - CDK: `StringParameter` constructs for each parameter; IAM policy grant on instance role
+
 ## [0.4.0] - 2026-03-18
 
 ### Added
@@ -94,7 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PHP hardening, Docker user namespace remapping, Composer integrity checks,
   encrypted EBS and RDS at rest, Secrets Manager for RDS credentials
 
-[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/scttfrdmn/aws-hubzero/compare/v0.1.0...v0.2.0

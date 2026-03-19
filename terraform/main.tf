@@ -60,6 +60,25 @@ data "aws_ami" "al2023" {
   }
 }
 
+# Baked HubZero AMI (built by Packer); falls back to AL2023 when not found
+data "aws_ami" "hubzero_baked" {
+  count       = var.use_baked_ami ? 1 : 0
+  most_recent = true
+  owners      = ["self"]
+  filter {
+    name   = "name"
+    values = ["hubzero-base-*"]
+  }
+}
+
+locals {
+  selected_ami = (
+    var.use_baked_ami && length(data.aws_ami.hubzero_baked) > 0
+    ? data.aws_ami.hubzero_baked[0].id
+    : data.aws_ami.al2023.id
+  )
+}
+
 # --- Networking (existing VPC) ---
 data "aws_vpc" "selected" {
   id = var.vpc_id
@@ -253,7 +272,7 @@ resource "aws_db_instance" "hubzero" {
 
 # --- EC2 ---
 resource "aws_instance" "hubzero" {
-  ami                         = data.aws_ami.al2023.id
+  ami                         = local.selected_ami
   instance_type               = local.config.instance_type
   subnet_id                   = data.aws_subnet.selected.id
   vpc_security_group_ids      = [aws_security_group.hubzero.id]
@@ -287,10 +306,16 @@ resource "aws_instance" "hubzero" {
     "export HUBZERO_CW_LOG_GROUP_PREFIX='/aws/ec2/hubzero-${var.environment}'",
     "export HUBZERO_S3_BUCKET='${var.enable_s3_storage ? aws_s3_bucket.hubzero[0].id : ""}'",
     "export HUBZERO_ENABLE_ALB='${tostring(var.enable_alb)}'",
+    "export HUBZERO_ENVIRONMENT='${var.environment}'",
+    "export HUBZERO_ENABLE_PARAMETER_STORE='${tostring(var.enable_parameter_store)}'",
+    var.use_baked_ami ? "" : file("${path.module}/../scripts/bake.sh"),
     file("${path.module}/../scripts/userdata.sh"),
   ]))
 
-  tags = { Name = "hubzero-${var.environment}" }
+  tags = {
+    Name          = "hubzero-${var.environment}"
+    "Patch Group" = "hubzero-${var.environment}"
+  }
 
   lifecycle {
     precondition {
@@ -863,4 +888,154 @@ resource "aws_vpc_endpoint" "logs" {
   subnet_ids          = [data.aws_subnet.selected.id]
   security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
   private_dns_enabled = true
+}
+
+# --- SSM Patch Manager (optional) ---
+resource "aws_ssm_patch_baseline" "hubzero" {
+  count            = var.enable_patch_manager ? 1 : 0
+  name             = "hubzero-${var.environment}"
+  operating_system = "AMAZON_LINUX_2023"
+  description      = "HubZero ${var.environment} security patch baseline"
+
+  approval_rule {
+    approve_after_days = 7
+    patch_filter {
+      key    = "CLASSIFICATION"
+      values = ["Security"]
+    }
+    patch_filter {
+      key    = "SEVERITY"
+      values = ["Critical", "Important"]
+    }
+  }
+}
+
+resource "aws_ssm_patch_group" "hubzero" {
+  count       = var.enable_patch_manager ? 1 : 0
+  baseline_id = aws_ssm_patch_baseline.hubzero[0].id
+  patch_group = "hubzero-${var.environment}"
+}
+
+resource "aws_ssm_maintenance_window" "hubzero" {
+  count    = var.enable_patch_manager ? 1 : 0
+  name     = "hubzero-${var.environment}-patches"
+  schedule = "cron(0 3 ? * SUN *)"
+  duration = 2
+  cutoff   = 1
+}
+
+resource "aws_ssm_maintenance_window_target" "hubzero" {
+  count         = var.enable_patch_manager ? 1 : 0
+  window_id     = aws_ssm_maintenance_window.hubzero[0].id
+  name          = "hubzero-${var.environment}-instances"
+  resource_type = "INSTANCE"
+
+  targets {
+    key    = "tag:Project"
+    values = ["hubzero"]
+  }
+}
+
+resource "aws_ssm_maintenance_window_task" "patch" {
+  count            = var.enable_patch_manager ? 1 : 0
+  window_id        = aws_ssm_maintenance_window.hubzero[0].id
+  task_type        = "RUN_COMMAND"
+  task_arn         = "AWS-RunPatchBaseline"
+  priority         = 1
+  service_role_arn = aws_iam_role.hubzero.arn
+
+  targets {
+    key    = "WindowTargetIds"
+    values = [aws_ssm_maintenance_window_target.hubzero[0].id]
+  }
+
+  task_invocation_parameters {
+    run_command_parameters {
+      parameter {
+        name   = "Operation"
+        values = ["Install"]
+      }
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "ssm_compliance" {
+  count               = var.enable_patch_manager && var.enable_monitoring ? 1 : 0
+  alarm_name          = "hubzero-${var.environment}-ssm-compliance"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "NonCompliantCount"
+  namespace           = "AWS/SSM"
+  period              = 86400
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "SSM Patch Manager found non-compliant instances"
+  dimensions = {
+    PatchGroup = "hubzero-${var.environment}"
+  }
+  alarm_actions = [aws_sns_topic.hubzero[0].arn]
+}
+
+# --- SSM Parameter Store (optional) ---
+resource "aws_ssm_parameter" "domain_name" {
+  count = var.enable_parameter_store ? 1 : 0
+  name  = "/hubzero/${var.environment}/domain_name"
+  type  = "String"
+  value = var.domain_name != "" ? var.domain_name : "unset"
+}
+
+resource "aws_ssm_parameter" "db_host" {
+  count = var.enable_parameter_store ? 1 : 0
+  name  = "/hubzero/${var.environment}/db_host"
+  type  = "String"
+  value = local.db_host
+}
+
+resource "aws_ssm_parameter" "db_name" {
+  count = var.enable_parameter_store ? 1 : 0
+  name  = "/hubzero/${var.environment}/db_name"
+  type  = "String"
+  value = "hubzero"
+}
+
+resource "aws_ssm_parameter" "db_user" {
+  count = var.enable_parameter_store ? 1 : 0
+  name  = "/hubzero/${var.environment}/db_user"
+  type  = "String"
+  value = "hubzero"
+}
+
+resource "aws_ssm_parameter" "s3_bucket" {
+  count = var.enable_parameter_store && var.enable_s3_storage ? 1 : 0
+  name  = "/hubzero/${var.environment}/s3_bucket"
+  type  = "String"
+  value = aws_s3_bucket.hubzero[0].id
+}
+
+resource "aws_ssm_parameter" "enable_monitoring" {
+  count = var.enable_parameter_store ? 1 : 0
+  name  = "/hubzero/${var.environment}/enable_monitoring"
+  type  = "String"
+  value = tostring(var.enable_monitoring)
+}
+
+resource "aws_ssm_parameter" "cw_log_prefix" {
+  count = var.enable_parameter_store ? 1 : 0
+  name  = "/hubzero/${var.environment}/cw_log_prefix"
+  type  = "String"
+  value = "/aws/ec2/hubzero-${var.environment}"
+}
+
+resource "aws_iam_role_policy" "parameter_store" {
+  count = var.enable_parameter_store ? 1 : 0
+  name  = "hubzero-parameter-store"
+  role  = aws_iam_role.hubzero.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParametersByPath", "ssm:GetParameter"]
+      Resource = "arn:aws:ssm:*:*:parameter/hubzero/${var.environment}/*"
+    }]
+  })
 }

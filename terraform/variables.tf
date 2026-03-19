@@ -109,3 +109,21 @@ variable "enable_vpc_endpoints" {
   default     = true
   description = "Create VPC endpoints for S3 (gateway) and SSM/Secrets Manager/CloudWatch (interface) services"
 }
+
+variable "use_baked_ami" {
+  type        = bool
+  default     = true
+  description = "Use a pre-baked HubZero AMI (hubzero-base-*) when available; falls back to AL2023 base AMI"
+}
+
+variable "enable_patch_manager" {
+  type        = bool
+  default     = true
+  description = "Enable SSM Patch Manager for automated security patching"
+}
+
+variable "enable_parameter_store" {
+  type        = bool
+  default     = true
+  description = "Store configuration in SSM Parameter Store and source at instance launch"
+}

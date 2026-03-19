@@ -107,6 +107,11 @@ export class HubzeroStack extends cdk.Stack {
     const enableWaf = this.node.tryGetContext("enableWaf") !== "false";
     const enableVpcEndpoints =
       this.node.tryGetContext("enableVpcEndpoints") !== "false";
+    const useBakedAmi = this.node.tryGetContext("useBakedAmi") !== "false";
+    const enablePatchManager =
+      this.node.tryGetContext("enablePatchManager") !== "false";
+    const enableParameterStore =
+      this.node.tryGetContext("enableParameterStore") !== "false";
     const enableMonitoring = this.node.tryGetContext("enableMonitoring") !== "false";
     const alarmEmail: string = this.node.tryGetContext("alarmEmail") || "";
     const monConfig = MONITORING_CONFIG[props.environment];
@@ -151,9 +156,16 @@ export class HubzeroStack extends cdk.Stack {
       "DNS TCP outbound"
     );
 
-    const ami = ec2.MachineImage.latestAmazonLinux2023({
-      cpuType: ec2.AmazonLinuxCpuType.X86_64,
-    });
+    // When useBakedAmi is enabled, look up a pre-baked HubZero AMI (built by
+    // Packer). Falls back to the latest AL2023 base AMI if no baked image exists.
+    const ami = useBakedAmi
+      ? ec2.MachineImage.lookup({
+          name: "hubzero-base-*",
+          owners: ["self"],
+        })
+      : ec2.MachineImage.latestAmazonLinux2023({
+          cpuType: ec2.AmazonLinuxCpuType.X86_64,
+        });
 
     // --- RDS (optional) ---
     let dbHost = "localhost";
@@ -260,6 +272,8 @@ export class HubzeroStack extends cdk.Stack {
       `export HUBZERO_CW_LOG_GROUP_PREFIX="${logGroupPrefix}"`,
       `export HUBZERO_S3_BUCKET="${s3BucketName}"`,
       `export HUBZERO_ENABLE_ALB="${enableAlb}"`,
+      `export HUBZERO_ENVIRONMENT="${props.environment}"`,
+      `export HUBZERO_ENABLE_PARAMETER_STORE="${enableParameterStore}"`,
     ];
 
     userData.addCommands(...envExports);
@@ -494,6 +508,69 @@ export class HubzeroStack extends cdk.Stack {
           privateDnsEnabled: true,
         });
       }
+    }
+
+    // --- SSM Patch Manager (optional) ---
+    if (enablePatchManager) {
+      // Add Patch Group tag to instance so SSM can target it
+      cdk.Tags.of(instance).add("Patch Group", `hubzero-${props.environment}`);
+
+      const patchBaseline = new cdk.aws_ssm.CfnPatchBaseline(this, "PatchBaseline", {
+        name: `hubzero-${props.environment}`,
+        operatingSystem: "AMAZON_LINUX_2023",
+        description: `HubZero ${props.environment} security patch baseline`,
+        approvalRules: {
+          patchRules: [
+            {
+              approveAfterDays: 7,
+              patchFilterGroup: {
+                patchFilters: [
+                  { key: "CLASSIFICATION", values: ["Security"] },
+                  { key: "SEVERITY", values: ["Critical", "Important"] },
+                ],
+              },
+            },
+          ],
+        },
+      });
+
+      const patchGroup = new cdk.aws_ssm.CfnAssociation(this, "PatchGroup", {
+        name: "AWS-RunPatchBaseline",
+        targets: [
+          { key: "tag:Patch Group", values: [`hubzero-${props.environment}`] },
+        ],
+        parameters: { Operation: ["Scan"] },
+        scheduleExpression: "cron(0 3 ? * SUN *)",
+      });
+      patchGroup.node.addDependency(patchBaseline);
+    }
+
+    // --- SSM Parameter Store (optional) ---
+    if (enableParameterStore) {
+      const ssmPrefix = `/hubzero/${props.environment}`;
+
+      new cdk.aws_ssm.StringParameter(this, "ParamDomainName", {
+        parameterName: `${ssmPrefix}/domain_name`,
+        stringValue: domainName || "unset",
+      });
+      new cdk.aws_ssm.StringParameter(this, "ParamEnableMonitoring", {
+        parameterName: `${ssmPrefix}/enable_monitoring`,
+        stringValue: String(enableMonitoring),
+      });
+      new cdk.aws_ssm.StringParameter(this, "ParamCwLogPrefix", {
+        parameterName: `${ssmPrefix}/cw_log_prefix`,
+        stringValue: logGroupPrefix,
+      });
+
+      // IAM policy: allow EC2 to read all params in its environment path
+      instance.role.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["ssm:GetParametersByPath", "ssm:GetParameter"],
+          resources: [
+            `arn:aws:ssm:${this.region}:${this.account}:parameter${ssmPrefix}/*`,
+          ],
+        })
+      );
     }
 
     // --- EBS Snapshot Lifecycle ---
