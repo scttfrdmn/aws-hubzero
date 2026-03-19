@@ -81,8 +81,9 @@ dnf install -y mariadb105
 ###############################################################################
 # AL2023: versioned PHP packages
 dnf -y install php8.2 php8.2-cli php8.2-common php8.2-mysqlnd php8.2-xml \
-  php8.2-mbstring php8.2-gd php8.2-curl php8.2-zip php8.2-intl \
-  php8.2-ldap php8.2-opcache php8.2-soap php8.2-json php8.2-fpm
+  php8.2-mbstring php8.2-gd php8.2-zip php8.2-intl \
+  php8.2-ldap php8.2-opcache php8.2-soap php8.2-fpm
+# json is built into PHP 8.2 core; curl extension is bundled in php8.2-common
 
 cat > /etc/php.d/99-hubzero.ini <<'PHPINI'
 upload_max_filesize = 128M
