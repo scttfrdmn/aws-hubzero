@@ -137,9 +137,24 @@ fi
 chown -R apache:apache /var/www/hubzero
 chmod -R 755 /var/www/hubzero
 
-if [ -d /var/www/hubzero/app/config ]; then
-    chmod 750 /var/www/hubzero/app/config
-    chmod 640 /var/www/hubzero/app/config/*.php 2>/dev/null || true
-fi
+# Create .htaccess for mod_rewrite URL routing (not included in the repo)
+cat > /var/www/hubzero/.htaccess <<'HTACCESS'
+Options -Indexes +FollowSymLinks
+RewriteEngine On
+RewriteBase /
+
+# Route all non-file/non-directory requests through index.php
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule .* index.php [L]
+HTACCESS
+chown apache:apache /var/www/hubzero/.htaccess
+
+# Create app/ directories the web installer needs to write to
+mkdir -p /var/www/hubzero/app/config \
+         /var/www/hubzero/app/logs \
+         /var/www/hubzero/app/tmp
+chown -R apache:apache /var/www/hubzero/app
+chmod -R 775 /var/www/hubzero/app
 
 echo "=== HubZero bake completed at $(date) ==="
