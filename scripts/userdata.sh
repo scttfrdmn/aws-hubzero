@@ -6,8 +6,11 @@
 # to this script by the Terraform/CDK launcher.
 set -euo pipefail
 
-exec > >(tee /var/log/hubzero-userdata.log) 2>&1
+# Create and lock down the log file before redirecting output to it.
+# (chmod after exec > >(tee ...) races with tee creating the file in piped bash.)
+touch /var/log/hubzero-userdata.log
 chmod 600 /var/log/hubzero-userdata.log
+exec > >(tee -a /var/log/hubzero-userdata.log) 2>&1
 
 # IMDSv2 token-based metadata retrieval
 IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
