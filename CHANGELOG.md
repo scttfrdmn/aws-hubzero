@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-03-20
+
+### Fixed
+- `terraform/main.tf`: added `force_destroy = true` to `aws_s3_bucket` — versioned buckets previously required manual emptying before `terraform destroy` could succeed
+- `terraform/main.tf`: removed `lifecycle { prevent_destroy = true }` from `aws_dlm_lifecycle_policy` — it blocked `terraform destroy` entirely
+- `terraform/main.tf`: added explicit `skip_destroy = false` to all three `aws_cloudwatch_log_group` resources for unambiguous destroy behaviour
+- `README.md`: added **Destroying the Stack** section documenting the required `aws_region` variable, the `terraform destroy` command, and manual cleanup steps for EBS snapshots created by the DLM policy
+
 ## [0.7.1] - 2026-03-20
 
 ### Fixed
