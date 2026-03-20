@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-03-20
+
 ### Fixed
 - `cdk/lib/hubzero-stack.ts`: migrated from `AWS::AutoScaling::LaunchConfiguration` to `AWS::EC2::LaunchTemplate` — AWS no longer allows LaunchConfiguration creation in new accounts
 - `cdk/lib/hubzero-stack.ts`: created `InstanceRole` explicitly (required when using `LaunchTemplate`); replaced all `asg.role` references with `instanceRole`
