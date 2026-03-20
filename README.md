@@ -80,6 +80,62 @@ Internet ──► CloudFront (CDN, optional)
 All optional features (ALB, WAF, EFS, S3, CDN, monitoring, VPC endpoints,
 Parameter Store, Patch Manager) are individually toggleable with boolean variables.
 
+## AWS Services Used — and Why
+
+If you are coming from a traditional bare-metal or VM-based HubZero install, the
+number of AWS services involved can look daunting. This section explains what each
+one does and why it exists — usually replacing something you were doing manually.
+
+### Compute
+
+| Service | What it does | Why it's used here |
+|---|---|---|
+| **EC2** | The virtual machine that runs Apache, PHP, and HubZero | Direct replacement for your physical server or on-prem VM |
+| **Auto Scaling Group** | Keeps exactly one EC2 instance running at all times | If the instance crashes or fails a health check, the ASG automatically launches a replacement — no manual restart needed. It is *not* for horizontal scaling (min=max=1). |
+| **Launch Template** | Defines the instance configuration (AMI, instance type, user data, IAM role) | The blueprint the ASG uses to launch a replacement instance. Using a Launch Template (not a Launch Configuration) is required by newer AWS accounts. |
+| **Amazon Linux 2023** | The operating system | AWS's supported Linux with SELinux, systemd, dnf, and built-in SSM agent. Receives security patches through Patch Manager. |
+
+### Networking
+
+| Service | What it does | Why it's used here |
+|---|---|---|
+| **VPC** | Your private network inside AWS | Required container for all other resources. You provide an existing VPC — this project does not create one. |
+| **Security Groups** | Stateful firewall rules on each resource | Replaces iptables. The EC2 instance only accepts traffic from the ALB; the ALB only accepts traffic from your CIDR. No port 22 (SSH) is opened. |
+| **Application Load Balancer (ALB)** | Terminates HTTPS and forwards HTTP to the instance | Replaces running Nginx or certbot directly on the server. The ALB handles TLS so the instance only sees plain HTTP on port 80. |
+| **ACM (Certificate Manager)** | Provisions and auto-renews the TLS certificate | Replaces certbot/Let's Encrypt. The certificate is free, AWS-managed, and never expires unexpectedly. No cron job needed. |
+| **WAF v2** | Web application firewall in front of the ALB | Blocks common web attacks (OWASP top 10, SQL injection, known bad inputs) using AWS-managed rule sets — without configuring ModSecurity on the instance. |
+| **CloudFront** | Global CDN that caches static assets near users | Optional. Speeds up page loads for geographically distributed users by serving cached CSS/JS/images from edge locations. |
+| **VPC Endpoints** | Private network paths to AWS services (S3, SSM, Secrets Manager, CloudWatch) | Without these, the instance needs an internet gateway to call AWS APIs. Endpoints keep that traffic on the AWS private network and eliminate the internet path. Savings of ~$35/mo in interface endpoints — disabled by default in test. |
+
+### Storage
+
+| Service | What it does | Why it's used here |
+|---|---|---|
+| **EBS (Elastic Block Store)** | The instance's root disk | Replaces your server's local hard drive. Encrypted at rest. The ASG attaches a fresh volume on each launch unless EFS is used for the web root. |
+| **EFS (Elastic File System)** | Network filesystem mounted at `/var/www/hubzero` | Replaces an NFS share. When the ASG replaces an instance, EFS means the HubZero files survive — the new instance mounts the same filesystem and picks up exactly where the old one left off. Required for the spot profile. |
+| **S3** | Object storage for HubZero file uploads | Replaces storing uploads on local disk. Cheaper than EBS per GB, durable across availability zones, and accessible even if the instance is replaced. |
+| **DLM (Data Lifecycle Manager)** | Takes daily EBS snapshots automatically | Replaces a cron job that runs `aws ec2 create-snapshot`. Snapshots are retained for 7 days (30 for prod) and tagged for easy identification. The policy is retained (not deleted) when the stack is destroyed so in-flight snapshots are not interrupted. |
+
+### Database
+
+| Service | What it does | Why it's used here |
+|---|---|---|
+| **RDS MariaDB** | Managed relational database (optional; `use_rds=true`) | Replaces running MariaDB on the same instance. AWS handles OS patching, automated backups, storage autoscaling, and Multi-AZ failover. You never SSH into the database server. Set `use_rds=false` for test environments to save ~$55/mo. |
+| **Secrets Manager** | Stores the RDS master password | Replaces passwords in config files. The password is auto-generated at deploy time, rotatable, and never written to the Terraform state file in plaintext. The instance retrieves it at boot via IAM role. |
+
+### Operations
+
+| Service | What it does | Why it's used here |
+|---|---|---|
+| **SSM Session Manager** | Browser/CLI shell access to the instance | Replaces SSH. No port 22, no key pair to manage, no bastion host. Access is controlled by IAM. Session activity can be logged to CloudWatch. |
+| **SSM Parameter Store** | Stores runtime configuration (domain, DB host, S3 bucket, etc.) | Replaces hard-coded values in config files or environment variables baked into the AMI. The instance reads its configuration at boot so the same AMI works in every environment. |
+| **SSM Patch Manager** | Applies OS security patches on a schedule | Replaces a cron job running `dnf update`. Patches are applied weekly during a Sunday maintenance window; only Security/Critical patches with a 7-day approval delay. |
+| **IAM Role** | Grants the EC2 instance permission to call AWS APIs | The instance never needs long-lived credentials. It authenticates to S3, SSM, Secrets Manager, and CloudWatch using its attached role — no `aws configure` on the server. |
+| **CloudWatch Logs** | Centralises Apache and bootstrap logs | Replaces tailing log files over SSH. Log groups survive instance replacement; you can search and alert on them without connecting to the instance. |
+| **CloudWatch Alarms + SNS** | Sends alerts when CPU, memory, disk, or RDS metrics exceed thresholds | Replaces Nagios/Zabbix for basic health monitoring. Alarm → SNS topic → email when something needs attention. |
+
+---
+
 ## Prerequisites
 
 - AWS account with permissions to create EC2, RDS, ALB, IAM, and related resources
@@ -520,8 +576,8 @@ GIT_SHA=$(git rev-parse --short HEAD) packer build \
 ## Migrating from On-Premises
 
 See [docs/migration-guide.md](docs/migration-guide.md) for a step-by-step guide
-to migrating an existing on-premises HubZero instance, including a migration
-script at `scripts/migrate.sh`.
+to migrating an existing on-premises HubZero instance (database dump, app file
+sync, and configuration update).
 
 ## Teardown
 
