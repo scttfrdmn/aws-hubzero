@@ -466,10 +466,6 @@ resource "aws_dlm_lifecycle_policy" "hubzero" {
   execution_role_arn = aws_iam_role.dlm.arn
   state              = "ENABLED"
 
-  lifecycle {
-    prevent_destroy = true
-  }
-
   policy_details {
     resource_types = ["INSTANCE"]
 
