@@ -321,6 +321,17 @@ aws ec2 describe-snapshots --owner-ids self --region us-west-2 \
 aws ec2 delete-snapshot --snapshot-id snap-xxx --region us-west-2
 ```
 
+To also remove the Terraform state backend (S3 bucket + DynamoDB table), run the teardown script **after** `terraform destroy`:
+
+```bash
+TF_STATE_BUCKET=hubzero-terraform-state-<account-id> \
+TF_LOCK_TABLE=hubzero-terraform-locks \
+AWS_REGION=us-west-2 \
+bash scripts/teardown-terraform-backend.sh
+```
+
+The script verifies the state is empty before deleting. Pass `--force` to skip the confirmation prompt.
+
 CloudWatch log groups are deleted by `terraform destroy`. If they were created outside Terraform, delete them manually:
 
 ```bash
