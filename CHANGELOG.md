@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-03-20
+
+### Added
+- `README.md`: new "AWS Services Used — and Why" section explaining each service's role and the on-prem equivalent it replaces — covers Compute, Networking, Storage, Database, and Operations groups
+
+### Fixed
+- `README.md`: removed stale reference to `scripts/migrate.sh` (script does not exist)
+
 ## [0.7.4] - 2026-03-20
 
 ### Fixed
