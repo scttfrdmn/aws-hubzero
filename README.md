@@ -303,11 +303,16 @@ cd terraform
 
 # Terraform (pass the same vars used at apply time)
 terraform destroy -var-file=environments/test.tfvars \
-  -var='aws_region=us-west-2' \
   -var='vpc_id=vpc-...' \
   -var='subnet_id=subnet-...' \
   -var='allowed_cidr=0.0.0.0/0'
 ```
+
+> **Important:** `aws_region` must match the region used during `terraform apply`.
+> If your region differs from the default (`us-east-1`), either uncomment the
+> `aws_region` line in your `.tfvars` file (recommended) or pass
+> `-var='aws_region=<your-region>'` explicitly. Omitting it causes some
+> operations (S3, SNS) to target the wrong region during destroy.
 
 The S3 bucket has `force_destroy = true` so Terraform empties and deletes it automatically. After `terraform destroy` completes, check for these resources that Terraform does **not** delete:
 

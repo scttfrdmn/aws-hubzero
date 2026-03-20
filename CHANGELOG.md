@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-03-19
+
+### Fixed
+- `docs/migration-guide.md`: replaced reference to non-existent `migrate.sh` script with explicit manual migration steps (mysqldump pipeline, rsync, config update)
+- `docs/migration-guide.md`: corrected on-prem `app/` path — HubZero 2.4 uses `/var/www/hubzero/app/`, not `/var/www/html/app/`; note added for older installs
+- `docs/migration-guide.md`: pre-migration checklist no longer assumes `enable_alb=true` for the health check step
+- `terraform/environments/test.tfvars`, `staging.tfvars`, `prod.tfvars`: added commented `aws_region` hint — variable must be set if deploying outside `us-east-1` and must match at both `apply` and `destroy` time
+- `README.md`: destroy example no longer hardcodes `us-west-2`; added note explaining the `aws_region` requirement
+- `docs/getting-started-aws.md`: removed stale "I destroyed the stack" advice about S3 bucket manual emptying (now handled by `force_destroy = true`) and CloudWatch log groups; replaced with note about EBS snapshots and the state backend teardown script
+
 ## [0.7.2] - 2026-03-20
 
 ### Fixed

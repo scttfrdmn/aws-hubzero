@@ -5,8 +5,9 @@ AWS infrastructure in this project.
 
 ## Pre-Migration Checklist
 
-- [ ] AWS deployment is running and healthy (ALB target group shows instance as
-  healthy; see [README](../README.md) for deployment instructions)
+- [ ] AWS deployment is running and healthy (bootstrap complete — see
+  [Monitoring the Bootstrap](../README.md#monitoring-the-bootstrap); if using
+  `enable_alb=true`, the ALB target group shows the instance as healthy)
 - [ ] SSH or SCP access from the AWS instance to the on-prem server
 - [ ] On-prem HubZero version is v2.4 (or migration SQL adjustments are planned)
 - [ ] Sufficient disk space: on EFS (`/var/www/hubzero`) for app files, and
@@ -67,9 +68,9 @@ Replace `<asg-name>` with the `asg_name` / `AsgName` output from your deploy.
 
 ### 2. Ensure SSH connectivity from the AWS instance to on-prem
 
-The migration script runs on the AWS instance and pulls data from the on-prem
-server over SSH. If your on-prem server is not publicly reachable, you will
-need to set up a bastion or VPN.
+The migration runs on the AWS instance and pulls data from the on-prem server
+over SSH. If your on-prem server is not publicly reachable, you will need to
+set up a bastion or VPN.
 
 ```bash
 # From within the SSM session on the AWS instance:
@@ -79,32 +80,79 @@ ssh -i /path/to/key user@onprem-server hostname
 If you have no direct path, use the S3 bucket as an intermediary (see
 [Manual migration via S3](#manual-migration-via-s3) below).
 
-### 3. Run the migration script
+### 3. Migrate the database and app files
+
+Perform these steps from within the SSM session on the AWS instance.
+
+**Step 3a — Put on-prem hub into maintenance mode** (edit via on-prem admin panel
+or config file, or simply schedule the migration during low-traffic hours).
+
+**Step 3b — Dump and import the database:**
 
 ```bash
-sudo bash /var/www/hubzero-aws/scripts/migrate.sh \
-  <on-prem-host> [ssh-user] [ssh-key-path]
+# On the AWS instance: dump from on-prem over SSH and pipe directly into RDS
+# Source the DB credentials written by userdata.sh
+source /root/.hubzero-credentials
+
+# Dump the on-prem database over SSH and import in one pipeline
+ssh -i /path/to/key user@onprem-server \
+  "mysqldump -u root --single-transaction --routines hubzero" \
+  | mysql -h "${HUBZERO_DB_HOST}" -u "${HUBZERO_DB_USER}" \
+          -p"${HUBZERO_DB_PASS}" "${HUBZERO_DB_NAME}"
 ```
 
-Example:
+If the dump is large (>1 GB), dump to a file first:
 
 ```bash
-sudo bash /var/www/hubzero-aws/scripts/migrate.sh \
-  hub.example.edu root ~/.ssh/onprem_key
+ssh -i /path/to/key user@onprem-server \
+  "mysqldump -u root --single-transaction --routines hubzero | gzip" \
+  > /tmp/hubzero-dump.sql.gz
+
+gunzip < /tmp/hubzero-dump.sql.gz \
+  | mysql -h "${HUBZERO_DB_HOST}" -u "${HUBZERO_DB_USER}" \
+          -p"${HUBZERO_DB_PASS}" "${HUBZERO_DB_NAME}"
 ```
 
-The script:
+**Step 3c — Sync the `app/` directory (uploads, extensions, templates):**
 
-1. Puts the source hub into maintenance mode
-2. Dumps the database with `mysqldump` over SSH
-3. Transfers the dump to the AWS instance
-4. Imports into RDS (or local MariaDB if `use_rds=false`)
-5. Rsyncs the `app/` directory (uploads, extensions, config) to EFS
-6. Rewrites database connection settings for the new environment
-7. Rebuilds the Solr search index (if `install_platform=true`)
-8. Restarts Apache and PHP-FPM
+The on-prem `app/` directory path depends on your existing installation:
+- HubZero 2.4 on-prem: `/var/www/hubzero/app/`
+- Older HubZero installs: `/var/www/html/app/` or `/var/www/html/hubzero/app/`
 
-Progress is logged to `/var/log/hubzero-migration.log`.
+```bash
+# On the AWS instance — rsync from on-prem (EFS is already mounted at /var/www/hubzero)
+rsync -az --delete \
+  -e "ssh -i /path/to/key" \
+  user@onprem-server:/var/www/hubzero/app/ \
+  /var/www/hubzero/app/
+
+chown -R apache:apache /var/www/hubzero/app/
+```
+
+**Step 3d — Update database connection settings:**
+
+Edit `/var/www/hubzero/app/config/database.php` to use the AWS database
+credentials (already written to `/root/.hubzero-credentials` by userdata.sh):
+
+```bash
+source /root/.hubzero-credentials
+# Verify the current config:
+grep -E "host|database|username" /var/www/hubzero/app/config/database.php
+```
+
+Update the host, database name, username, and password to match the AWS values.
+The exact format depends on your HubZero version; use the admin panel
+(`/administrator → Global Configuration → Database`) if available.
+
+**Step 3e — Restart services:**
+
+```bash
+sudo systemctl restart httpd php-fpm
+```
+
+Progress of each step is visible in the terminal. If any step fails, the
+on-prem server is unaffected (the dump is read-only; maintenance mode can be
+cleared at any time).
 
 ### 4. Verify before switching DNS
 
@@ -190,7 +238,10 @@ If direct SSH from AWS to on-prem is not available, use S3 as an intermediary:
 mysqldump -u root hubzero | gzip | \
   aws s3 cp - s3://<s3-bucket>/migration/hubzero-db.sql.gz
 
-rsync -az --delete /var/www/html/app/ /tmp/hubzero-app-snapshot/
+# Adjust the source path to match your on-prem install:
+# HubZero 2.4: /var/www/hubzero/app/
+# Older installs: /var/www/html/app/ or /var/www/html/hubzero/app/
+rsync -az --delete /var/www/hubzero/app/ /tmp/hubzero-app-snapshot/
 tar czf - /tmp/hubzero-app-snapshot/ | \
   aws s3 cp - s3://<s3-bucket>/migration/hubzero-app.tar.gz
 
@@ -213,13 +264,13 @@ import commands above.
 
 ## Rollback
 
-The migration script only reads from the on-prem server (except maintenance
-mode). If anything goes wrong:
+The migration steps are non-destructive on the on-prem server (mysqldump is
+read-only; maintenance mode can be cleared immediately). If anything goes wrong:
 
 1. Revert DNS to the on-prem server's address.
-2. Clear the maintenance mode on the on-prem server if it was set.
-3. The database dump is preserved at `/root/hubzero-migration-<timestamp>/`
-   on the AWS instance for post-mortem analysis.
+2. Clear maintenance mode on the on-prem server if it was set.
+3. Any database dump files written to `/tmp/` on the AWS instance are preserved
+   for post-mortem analysis.
 
 The AWS deployment is unaffected by a DNS rollback — you can re-attempt the
 migration after addressing any issues.

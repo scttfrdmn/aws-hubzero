@@ -1,4 +1,5 @@
 environment         = "test"
+# aws_region = "us-east-1"   # set this if not us-east-1 — must be passed at both apply AND destroy time
 install_platform    = false
 deployment_profile  = "minimal"   # t3.medium on-demand (~$30/mo)
 use_rds             = false        # local MariaDB saves ~$55/mo for test

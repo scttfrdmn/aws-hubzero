@@ -448,10 +448,12 @@ minutes for validation to complete.
 
 Check for:
 - RDS with deletion protection (`aws rds describe-db-instances`)
-- Snapshots created by the DLM policy
-- CloudWatch log groups (not deleted by Terraform destroy by default when
-  they contain data)
-- The S3 bucket (must be emptied before Terraform can delete it)
+- EBS snapshots created by the DLM lifecycle policy — Terraform does not
+  delete snapshots automatically; see the
+  [Destroying the Stack](../README.md#destroying-the-stack) section for commands
+- The Terraform state S3 bucket and DynamoDB table — these are created by
+  `bootstrap-terraform-backend.sh` and are not part of `terraform destroy`;
+  run `scripts/teardown-terraform-backend.sh` after destroy to remove them
 
 **"I get a 403 or 'blocked' response from the ALB"**
 
@@ -544,3 +546,8 @@ and follow the Quick Start instructions.
 For your first deployment, use `environment=test` with a single subnet. The
 full production configuration with a domain name, TLS certificate, and
 multi-AZ RDS can come once you have a working test deployment.
+
+When you are done testing and want to remove all resources, see
+[Destroying the Stack](../README.md#destroying-the-stack) in the README.
+After `terraform destroy`, also run `scripts/teardown-terraform-backend.sh`
+to remove the Terraform state S3 bucket and DynamoDB table.
