@@ -503,18 +503,21 @@ resource "aws_cloudwatch_log_group" "userdata" {
   count             = var.enable_monitoring ? 1 : 0
   name              = "/aws/ec2/hubzero-${var.environment}/userdata"
   retention_in_days = local.mon.log_retention
+  skip_destroy      = false
 }
 
 resource "aws_cloudwatch_log_group" "apache_access" {
   count             = var.enable_monitoring ? 1 : 0
   name              = "/aws/ec2/hubzero-${var.environment}/apache-access"
   retention_in_days = local.mon.log_retention
+  skip_destroy      = false
 }
 
 resource "aws_cloudwatch_log_group" "apache_error" {
   count             = var.enable_monitoring ? 1 : 0
   name              = "/aws/ec2/hubzero-${var.environment}/apache-error"
   retention_in_days = local.mon.log_retention
+  skip_destroy      = false
 }
 
 resource "aws_sns_topic" "hubzero" {
@@ -638,6 +641,9 @@ resource "aws_cloudwatch_metric_alarm" "rds_connections" {
 resource "aws_s3_bucket" "hubzero" {
   count         = var.enable_s3_storage ? 1 : 0
   bucket_prefix = "hubzero-${var.environment}-"
+  # force_destroy empties versioned objects so `terraform destroy` can delete
+  # the bucket. Set to false in production if you want an extra guard.
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_versioning" "hubzero" {

@@ -296,6 +296,39 @@ sudo tail -f /var/log/hubzero-userdata.log
 Bootstrap completes in roughly 3–5 minutes when using a pre-baked AMI, or
 10–15 minutes from the base AL2023 AMI.
 
+## Destroying the Stack
+
+```bash
+cd terraform
+
+# Terraform (pass the same vars used at apply time)
+terraform destroy -var-file=environments/test.tfvars \
+  -var='aws_region=us-west-2' \
+  -var='vpc_id=vpc-...' \
+  -var='subnet_id=subnet-...' \
+  -var='allowed_cidr=0.0.0.0/0'
+```
+
+The S3 bucket has `force_destroy = true` so Terraform empties and deletes it automatically. After `terraform destroy` completes, check for these resources that Terraform does **not** delete:
+
+```bash
+# EBS snapshots created by the DLM lifecycle policy
+aws ec2 describe-snapshots --owner-ids self --region us-west-2 \
+  --filters "Name=tag:Project,Values=hubzero" \
+  --query 'Snapshots[*].[SnapshotId,StartTime]' --output table
+
+# Delete them (replace IDs):
+aws ec2 delete-snapshot --snapshot-id snap-xxx --region us-west-2
+```
+
+CloudWatch log groups are deleted by `terraform destroy`. If they were created outside Terraform, delete them manually:
+
+```bash
+aws logs delete-log-group --log-group-name /aws/ec2/hubzero-test/userdata --region us-west-2
+aws logs delete-log-group --log-group-name /aws/ec2/hubzero-test/apache-access --region us-west-2
+aws logs delete-log-group --log-group-name /aws/ec2/hubzero-test/apache-error --region us-west-2
+```
+
 ## Environments
 
 Instance type is set by `deployment_profile` (default: t3.medium). Use
