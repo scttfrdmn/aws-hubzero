@@ -115,6 +115,9 @@ export class HubzeroStack extends cdk.Stack {
       this.node.tryGetContext("instanceType") || "";
     const ec2InstanceType = instanceTypeOverride || profile.instanceType;
     const vpcId = this.node.tryGetContext("vpcId");
+    if (!vpcId) {
+      throw new Error("vpcId is required — set it in cdk.context.json or pass -c vpcId=vpc-xxx");
+    }
     const keyName = this.node.tryGetContext("keyName") || "";
     const allowedCidr: string = this.node.tryGetContext("allowedCidr");
     if (!allowedCidr) {
@@ -298,7 +301,12 @@ export class HubzeroStack extends cdk.Stack {
     if (enableS3Storage) {
       const storageBucket = new s3.Bucket(this, "StorageBucket", {
         versioned: true,
-        encryption: s3.BucketEncryption.KMS_MANAGED,
+        // prod uses KMS_MANAGED with RETAIN; non-prod uses S3_MANAGED so the
+        // auto-delete custom resource Lambda can empty the bucket without
+        // needing an explicit KMS key grant.
+        encryption: props.environment === "prod"
+          ? s3.BucketEncryption.KMS_MANAGED
+          : s3.BucketEncryption.S3_MANAGED,
         blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
         lifecycleRules: [
           {
@@ -355,10 +363,20 @@ export class HubzeroStack extends cdk.Stack {
       `curl -fsSL "${baseUrl}/userdata.sh" | bash`,
     );
 
-    // --- Auto Scaling Group (min=1) ---
-    const asg = new autoscaling.AutoScalingGroup(this, "ASG", {
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+    // --- Instance IAM Role ---
+    // Must be created explicitly when using a LaunchTemplate (AWS no longer
+    // supports LaunchConfigurations in new accounts).
+    const instanceRole = new iam.Role(this, "InstanceRole", {
+      assumedBy: new iam.ServicePrincipal("ec2.amazonaws.com"),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore"),
+      ],
+    });
+
+    // --- Launch Template ---
+    // spot profile: max bid well above typical spot price to ensure capacity.
+    // t3.medium on-demand is $0.0416/hr; spot typically runs $0.004–0.008/hr.
+    const launchTemplate = new ec2.LaunchTemplate(this, "LaunchTemplate", {
       instanceType: new ec2.InstanceType(ec2InstanceType),
       machineImage: ami,
       securityGroup: sg,
@@ -370,45 +388,42 @@ export class HubzeroStack extends cdk.Stack {
       blockDevices: [
         {
           deviceName: "/dev/xvda",
-          volume: autoscaling.BlockDeviceVolume.ebs(config.volumeSize, {
-            volumeType: autoscaling.EbsDeviceVolumeType.GP3,
+          volume: ec2.BlockDeviceVolume.ebs(config.volumeSize, {
+            volumeType: ec2.EbsDeviceVolumeType.GP3,
             encrypted: true,
           }),
         },
       ],
+      role: instanceRole,
+      spotOptions: profile.useSpot
+        ? { maxPrice: 0.10, requestType: ec2.SpotRequestType.ONE_TIME }
+        : undefined,
+    });
+
+    // --- Auto Scaling Group (min=1) ---
+    const asg = new autoscaling.AutoScalingGroup(this, "ASG", {
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+      launchTemplate,
       minCapacity: 1,
       maxCapacity: 1,
       desiredCapacity: 1,
       healthCheck: enableAlb
         ? autoscaling.HealthCheck.elb({ grace: cdk.Duration.minutes(5) })
         : autoscaling.HealthCheck.ec2(),
-      // spot profile: set a max bid well above typical spot price to ensure capacity.
-      // t3.medium on-demand is $0.0416/hr; spot typically runs $0.004–0.008/hr.
-      spotPrice: profile.useSpot ? "0.10" : undefined,
-      // Instance refresh (rolling): use CfnAutoScalingGroup override since
-      // AutoScalingGroupProps does not expose this directly in all CDK versions
-      ssmSessionPermissions: true,
     });
     // Convenience alias — used in the sections below
     const instance = asg;
-
-    const cfnAsg = asg.node.defaultChild as autoscaling.CfnAutoScalingGroup;
-
-    // Rolling instance refresh
-    cfnAsg.addPropertyOverride("InstanceRefresh", {
-      Strategy: "Rolling",
-      Preferences: { MinHealthyPercentage: 0 },
-    });
 
     cdk.Tags.of(asg).add("Patch Group", `hubzero-${props.environment}`);
 
     // S3 file storage access
     if (enableS3Storage && (this as any)._storageBucket) {
-      ((this as any)._storageBucket as s3.Bucket).grantReadWrite(asg.role);
+      ((this as any)._storageBucket as s3.Bucket).grantReadWrite(instanceRole);
     }
 
     // CloudWatch agent permissions (unconditional)
-    asg.role.addToPrincipalPolicy(
+    instanceRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: [
           "cloudwatch:PutMetricData",
@@ -425,7 +440,7 @@ export class HubzeroStack extends cdk.Stack {
     // Grant EC2 read access to the RDS-managed secret
     if (useRds && dbInstance) {
       const cfnDb = dbInstance.node.defaultChild as rds.CfnDBInstance;
-      asg.role.addToPrincipalPolicy(
+      instanceRole.addToPrincipalPolicy(
         new iam.PolicyStatement({
           actions: ["secretsmanager:GetSecretValue"],
           resources: [cfnDb.attrMasterUserSecretSecretArn],
@@ -655,7 +670,7 @@ export class HubzeroStack extends cdk.Stack {
       });
 
       // IAM policy: allow EC2 to read all params in its environment path
-      instance.role.addToPrincipalPolicy(
+      instanceRole.addToPrincipalPolicy(
         new iam.PolicyStatement({
           actions: ["ssm:GetParametersByPath", "ssm:GetParameter"],
           resources: [
@@ -884,11 +899,6 @@ export class HubzeroStack extends cdk.Stack {
         value: alarmTopic.topicArn,
       });
     }
-
-    // --- Tags & Outputs ---
-    cdk.Tags.of(this).add("Project", "hubzero");
-    cdk.Tags.of(this).add("Environment", props.environment);
-    cdk.Tags.of(this).add("ManagedBy", "cdk");
 
     // --- CloudFront (optional, requires ALB) ---
     if (enableCdn && enableAlb) {

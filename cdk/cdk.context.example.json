@@ -23,5 +23,5 @@
   "enableParameterStore": "true",
   "enablePatchManager": "true",
 
-  "useBakedAmi": "true"
+  "useBakedAmi": "false"
 }

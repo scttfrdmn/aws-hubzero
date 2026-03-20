@@ -204,15 +204,25 @@ terraform apply -var-file=environments/prod.tfvars \
 cd cdk
 npm install
 cp cdk.context.example.json cdk.context.json
-# Edit cdk.context.json
+# Edit cdk.context.json — set vpcId, allowedCidr, and desired feature flags
 
-npx cdk bootstrap   # one-time per account/region
+# One-time per account/region (requires CDK_DEFAULT_ACCOUNT and CDK_DEFAULT_REGION):
+CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text) \
+CDK_DEFAULT_REGION=us-east-1 \
+npx cdk bootstrap
 
-npx cdk deploy -c environment=test
+# Deploy (environment defaults to "test"; override with -c environment=staging/prod):
+CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text) \
+CDK_DEFAULT_REGION=us-east-1 \
+npx cdk deploy
+
+# Staging / production — pass domain overrides via context:
+CDK_DEFAULT_ACCOUNT=... CDK_DEFAULT_REGION=us-east-1 \
 npx cdk deploy -c environment=staging -c domainName=hub.example.com
-npx cdk deploy -c environment=prod    -c domainName=hub.example.com \
-                                       -c alarmEmail=ops@example.com
 ```
+
+> **Note:** `CDK_DEFAULT_ACCOUNT` and `CDK_DEFAULT_REGION` are required for VPC
+> lookups. The region must match where your VPC lives.
 
 ## Monitoring the Bootstrap
 
@@ -343,6 +353,27 @@ CloudWatch log groups are deleted by `terraform destroy`. If they were created o
 aws logs delete-log-group --log-group-name /aws/ec2/hubzero-test/userdata --region us-west-2
 aws logs delete-log-group --log-group-name /aws/ec2/hubzero-test/apache-access --region us-west-2
 aws logs delete-log-group --log-group-name /aws/ec2/hubzero-test/apache-error --region us-west-2
+```
+
+### CDK destroy
+
+```bash
+cd cdk
+CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text) \
+CDK_DEFAULT_REGION=us-east-1 \
+npx cdk destroy
+```
+
+CDK empties and deletes the S3 bucket automatically (via a custom resource Lambda). CloudWatch log groups and most resources are deleted cleanly. One resource is intentionally **retained** after destroy:
+
+- **DLM lifecycle policy** — left in the account with `RemovalPolicy.RETAIN` so any in-progress snapshots are not interrupted. Delete manually after destroy:
+
+```bash
+# List orphaned DLM policies
+aws dlm get-lifecycle-policies --query 'Policies[*].[PolicyId,Description,State]' --output table
+
+# Delete by policy ID
+aws dlm delete-lifecycle-policy --policy-id policy-xxxxxxxxxxxxxxxxx
 ```
 
 ## Environments
