@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-03-20
+
+### Fixed
+- `scripts/bake.sh`: `dnf install curl` now uses `--allowerasing` to replace AL2023's pre-installed `curl-minimal` (conflicting package)
+- `scripts/bake.sh`: removed `mod_headers` from dnf install — it is built into `httpd` on AL2023 and has no separate package
+- `scripts/bake.sh`: replaced MariaDB community repo install with native AL2023 `mariadb105` package (community repo `MariaDB-client` package name not valid on AL2023)
+- `scripts/bake.sh`: removed `php8.2-curl` and `php8.2-json` from dnf install — both are bundled in `php8.2-common` on AL2023 and have no separate packages
+- `scripts/bake.sh`: export `HOME` and `COMPOSER_HOME` before Composer installer runs — cloud-init executes with a minimal environment that may not have `HOME` set
+- `scripts/bake.sh`: corrected HubZero CMS git branch from `2.4` to `2.4-main`
+- `scripts/bake.sh`: corrected Apache `DocumentRoot` from `/var/www/hubzero/public` to `/var/www/hubzero` (HubZero 2.4 serves from the repo root)
+- `scripts/bake.sh`: run `composer install` in `core/` subdirectory (that is where `composer.json` lives in HubZero 2.4, not the repo root)
+- `scripts/bake.sh`: create `.htaccess` with `mod_rewrite` rules after clone — HubZero does not commit one to the repo, but it is required for framework URL routing
+- `scripts/bake.sh`: create `app/`, `app/config/`, `app/logs/`, `app/tmp/` directories owned by `apache` — required by the web installer before it can write config files
+- `scripts/userdata.sh`: replaced MariaDB community `MariaDB-server` with native AL2023 `mariadb105-server`
+- `scripts/userdata.sh`: `touch` log file before `chmod` and change `exec` redirect to `tee -a` — fixes race condition where `chmod` ran before `tee` had created the file in piped-bash execution (cloud-init `curl | bash` context)
+- `docs/getting-started-aws.md`, `README.md`: added deployment monitoring section with commands to track bootstrap progress (`terraform apply` completes in 2–3 min; full bootstrap takes 10–15 min)
+
 ## [0.7.0] - 2026-03-18
 
 ### Added
